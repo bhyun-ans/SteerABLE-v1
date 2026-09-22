@@ -18,8 +18,8 @@
 
 3. Clone this repository
     ```bash
-    git clone https://github.com/bhyun-ans/SteerABLEv1.git
-    cd ./SteerABLEv1
+    git clone https://github.com/bhyun-ans/SteerABLE-v1.git
+    cd ./SteerABLE-v1
     ```
 
 4. Run Docker with an interactive shell

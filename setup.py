@@ -60,7 +60,7 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="SteerABLE authors",
-    url="https://github.com/bhyun-ans/SteerABLEv1",
+    url="https://github.com/bhyun-ans/SteerABLE-v1",
     packages=find_packages(
         exclude=(
             "assets",

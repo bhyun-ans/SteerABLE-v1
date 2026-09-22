@@ -12,8 +12,8 @@ part of this repository; if you need it, use
 
 ### From source
 ```bash
-git clone https://github.com/bhyun-ans/SteerABLEv1.git
-cd SteerABLEv1
+git clone https://github.com/bhyun-ans/SteerABLE-v1.git
+cd SteerABLE-v1
 pip3 install -e .
 ```
 

@@ -43,7 +43,7 @@ When filing an issue, please check existing open, or recently closed, issues to 
 
 ### Find interesting issue
 
-If you spot a problem, [search whether an issue already exists](https://github.com/bhyun-ans/SteerABLEv1/issues). If a related issue doesn't exist, open a new one.
+If you spot a problem, [search whether an issue already exists](https://github.com/bhyun-ans/SteerABLE-v1/issues). If a related issue doesn't exist, open a new one.
 
 ### Solve an issue
 
