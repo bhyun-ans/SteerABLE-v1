@@ -4,7 +4,7 @@ Colabfold provides an easy-to-use and efficient MSA search pipeline that's ideal
 
 Here's an example:
 ```bash
-python3 scripts/colabfold_msa.py examples/dimer.fasta <path/to/colabfold_db> dimer_colabfold_msa --db1 uniref30_2103_db --db3 colabfold_envdb_202108_db --mmseqs_path <path/to/mmseqs> 
+python3 scripts/colabfold_msa.py path/to/your_complex.fasta <path/to/colabfold_db> your_colabfold_msa --db1 uniref30_2103_db --db3 colabfold_envdb_202108_db --mmseqs_path <path/to/mmseqs> 
 ```
 
 #### Configuring Colabfold_search

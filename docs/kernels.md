@@ -22,12 +22,12 @@
   
   3. **[DeepSpeed DS4Sci_EvoformerAttention kernel](https://www.deepspeed.ai/tutorials/ds4sci_evoformerattention/)** is a memory-efficient attention kernel developed as part of a collaboration between OpenFold and the DeepSpeed4Science initiative.
 
-      DS4Sci_EvoformerAttention is implemented based on [CUTLASS](https://github.com/NVIDIA/cutlass). If you use this feature, you need to clone the CUTLASS repository and specify the path to it in the environment variable `CUTLASS_PATH`. The [Dockerfile](Dockerfile) already includes this setting:
+      DS4Sci_EvoformerAttention is implemented based on [CUTLASS](https://github.com/NVIDIA/cutlass). If you use this feature, you need to clone the CUTLASS repository and specify the path to it in the environment variable `CUTLASS_PATH`. The [Dockerfile](../Dockerfile) already includes this setting:
       ```bash
       RUN git clone -b v3.5.1 https://github.com/NVIDIA/cutlass.git  /opt/cutlass
       ENV CUTLASS_PATH=/opt/cutlass
       ```
-      If you set up `Protenix` by `pip`, you can set environment variable `CUTLASS_PATH` as follows:
+      If you installed SteerABLE-v1 with `pip`, set `CUTLASS_PATH` as follows:
 
       ```bash
       git clone -b v3.5.1 https://github.com/NVIDIA/cutlass.git  /path/to/cutlass

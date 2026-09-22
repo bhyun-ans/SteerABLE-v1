@@ -1,10 +1,12 @@
 # Contributing
 
-Thank you for investing your time in contributing to protenix project! 
+Thank you for investing your time in contributing to SteerABLE-v1!
 
 Read our [Code of Conduct](./CODE_OF_CONDUCT.md) to keep our community approachable and respectable.
 
-This guide details how to use issues and pull requests to improve protenix project.
+This guide details how to use issues and pull requests to improve SteerABLE-v1.
+
+SteerABLE-v1 is a fork of [Protenix](https://github.com/bytedance/Protenix) (v1 lineage); its Protenix-v2 sibling is [SteerABLE](https://github.com/bhyun-ans/SteerABLE). If a change belongs upstream -- anything outside the epitope-steering code listed in the README's repository-layout table -- please send it to Protenix instead, so both projects get it.
 
 ## General Guidelines
 
@@ -41,11 +43,11 @@ When filing an issue, please check existing open, or recently closed, issues to 
 
 ### Find interesting issue
 
-If you spot a problem with the problem, [search if an issue already exists](https://github.com/bytedance/protenix/issues). If a related issue doesn't exist, you can open a new issue using [issue template](https://github.com/bytedance/protenix/issues/new/choose). 
+If you spot a problem, [search whether an issue already exists](https://github.com/bhyun-ans/SteerABLEv1/issues). If a related issue doesn't exist, open a new one.
 
 ### Solve an issue
 
-Please check `DEVELOPMENT.md` in sub folder to get familiar with running and testing codes.
+`examples/steerable/7yds/` is the quickest way to get a working run in front of you before changing anything.
 
 ### Open a Pull request.
 
