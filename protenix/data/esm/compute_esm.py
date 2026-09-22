@@ -135,8 +135,8 @@ def compute_esm2_embeddings(
 
 
 def pdb_sequences_iterator(
-    input_path="./scripts/msa/data/pdb_seqs/pdb_seq.csv",
-    save_path="./scripts/msa/data/pdb_seqs/pdb_labels_seqs.csv",
+    input_path="./pdb_seqs/pdb_seq.csv",
+    save_path="./pdb_seqs/pdb_labels_seqs.csv",
     start_id=0,
     end_id=-1,
 ):
@@ -210,8 +210,8 @@ def main():
     args = parser.parse_args()
 
     save_dir = f"./esm_embeddings/{args.model_name}"
-    pdb_seq_path = "./scripts/msa/data/pdb_seqs/pdb_seq.csv"
-    pdb_seq_label_path = "./scripts/msa/data/pdb_seqs/pdb_labels_seqs.csv"
+    pdb_seq_path = "./pdb_seqs/pdb_seq.csv"
+    pdb_seq_label_path = "./pdb_seqs/pdb_labels_seqs.csv"
 
     if not os.path.exists(save_dir):
         print("Make dir: ", save_dir)

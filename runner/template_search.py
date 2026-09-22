@@ -232,7 +232,10 @@ def update_template_info(
 
 
 if __name__ == "__main__":
+    # Point these at a directory holding your own precomputed MSAs. The
+    # bundled example ships one per chain, e.g. examples/steerable/7yds/msa/A
+    # (run examples/steerable/7yds/prepare.sh first to unpack them).
     run_template_search(
-        msa_for_template_search_dir="examples/5sak/1",
-        msa_for_template_search_name="pairing,non_pairing",
+        msa_for_template_search_dir="examples/steerable/7yds/msa/A",
+        msa_for_template_search_name="paired,unpaired",
     )

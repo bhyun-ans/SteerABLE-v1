@@ -92,10 +92,9 @@ class InferenceDataset(Dataset):
                 ), (
                     "Inference with template depends on the mmcif directory.\n"
                     "The mmcif directory containing cif files should be placed under $PROTENIX_ROOT_DIR/mmcif.\n"
-                    "You can download it from PDB https://www.wwpdb.org/ftp/pdb-ftp-sites or\n"
-                    "refer to scripts/database/download_protenix_data.sh to download inference dependency files, "
-                    "set use_template=false for inference, or set data.template.fetch_remote=true "
-                    "to download mmCIF files on demand from PDBe."
+                    "You can download it from PDB https://www.wwpdb.org/ftp/pdb-ftp-sites, "
+                    "set use_template=false for inference (the default), or set "
+                    "data.template.fetch_remote=true to download mmCIF files on demand from PDBe."
                 )
             else:
                 if template_mmcif_dir:
