@@ -1,4 +1,4 @@
-"""Truncated raised-cosine alpha schedule for hotspot-guided embedding steering.
+"""Truncated raised-cosine alpha schedule for epitope-guided embedding steering.
 
 This implements the flow-matching guidance-weight schedule
 

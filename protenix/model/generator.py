@@ -12,15 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-import math
 from typing import Any, Callable, Optional
 
 import torch
 
-from protenix.model.utils import centre_random_augmentation
+from protenix.model.utils import centre_random_augmentation, expand_at_dim
+from protenix.utils.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+# How many atoms per epitope residue enter the contact penalty, chosen by
+# smallest softmin distance to the antibody. Fixed at 1 -- only the single
+# closest atom of each epitope residue is pulled towards the antibody. This is
+# not configurable: it is the setting the released model was calibrated and
+# benchmarked with, and it interacts with `epitope.guidance_alpha`.
+CONTACT_TOP_K = 1
 
 
 class TrainingNoiseSampler:
@@ -139,9 +145,7 @@ def sample_diffusion(
     inplace_safe: bool = False,
     attn_chunk_size: Optional[int] = None,
     enable_efficient_fusion: bool = False,
-    guidance_kwargs: Optional[dict[str, Any]] = None,
-    save_trajectory: bool = False,
-    reward_buffer: Optional[list] = None,
+    epitope_configs: Optional[dict[str, Any]] = None,
 ) -> torch.Tensor:
     """Implements Algorithm 18 in AF3.
     It performances denoising steps from time 0 to time T.
@@ -173,80 +177,184 @@ def sample_diffusion(
         inplace_safe (bool): Whether to use inplace operations safely. Defaults to False.
         attn_chunk_size (Optional[int]): Chunk size for attention operation. Defaults to None.
         enable_efficient_fusion (bool): Whether to enable efficient fusion. Defaults to False.
-        guidance_kwargs (Optional[dict[str, Any]]): If provided, enables reward-guided
-            embedding steering. Expected keys: mask_pairs (list of
-            (residue_groups, partner_mask) per Ag chain), guidance_alpha, d0,
-            softmin_beta.
+        epitope_configs (Optional[dict[str, Any]]): SteerABLE-v1 reward-guided embedding-steering configs. When provided,
+            trunk embeddings (s_τ, z_τ) are updated each step via the gradient of an epitope-contact reward evaluated
+            on the denoiser's raw x̂0 output. Expected keys: "mask_pairs" (from build_guidance_masks), plus optional
+            "guidance_alpha" / "guidance_interval" / "alpha_init" / "alpha_trunc" / "d0" / "softmin_beta" /
+            "lambda_clash" / "clash_tau" / "clash_start_step". "guidance_interval" (int >= 1, default 8)
+            sets how OFTEN the reward + autograd + embedding update runs: steps 0, k, 2k, ... are steered and the
+            rest are plain no-grad sampler steps on the embeddings as they stand. alpha is still evaluated at the
+            raw step index, so the cosine schedule's truncation point and "clash_start_step" keep their step-space
+            meaning; only the density of updates changes, and the total steering applied scales as ~1/k.
+            Protenix-v1 has no Training-Free Guidance: x̂0 comes straight from `denoise_net` (the
+            DiffusionModule) and the coordinate update is the plain AF3 Euler step. Defaults to None (unguided).
 
     Returns:
         torch.Tensor: the denoised coordinates of x in inference stage
             [..., N_sample, N_atom, 3]
     """
-    from protenix.model.guidance import (
-        contact_epitope_reward,
-        epitope_clash_reward,
-        rms_normalize,
-    )
-
-    logger = logging.getLogger(__name__)
     N_atom = input_feature_dict["atom_to_token_idx"].size(-1)
     batch_shape = s_inputs.shape[:-2]
     device = s_inputs.device
     dtype = s_inputs.dtype
 
-    # ---- resolve guidance parameters ----
-    guidance_on = guidance_kwargs is not None and bool(guidance_kwargs)
-    if guidance_on:
-        g_mask_pairs = guidance_kwargs["mask_pairs"]
-        _raw_alpha = guidance_kwargs.get("guidance_alpha", None)
+    # ---- SteerABLE-v1 epitope-reward-guided embedding steering ----
+    epitope_on = epitope_configs is not None and bool(epitope_configs)
+    if epitope_on:
+        from protenix.model.steering import (
+            contact_epitope_reward,
+            epitope_clash_reward,
+            rms_normalize,
+        )
+        g_mask_pairs = epitope_configs["mask_pairs"]
+        _raw_alpha = epitope_configs.get("guidance_alpha", None)
         g_total_steps = len(noise_schedule) - 1
-
-        # Alpha resolution priority:
-        #   1. guidance_alpha (constant float) — overrides the schedule
-        #   2. truncated raised-cosine schedule (flow-matching paper form), default
         g_alpha_const = float(_raw_alpha) if _raw_alpha is not None else None
         g_alpha_schedule_fn = None
-        if g_alpha_const is not None:
-            _alpha_desc = f"alpha={g_alpha_const:.4f} (constant)"
-        else:
+        if g_alpha_const is None:
             from protenix.utils.alpha_schedule import make_cosine_trunc
-            g_alpha_init = float(guidance_kwargs.get("alpha_init", 1.0))
-            g_alpha_trunc = float(guidance_kwargs.get("alpha_trunc", 0.5))
+
+            g_alpha_init = float(epitope_configs.get("alpha_init", 1.0))
+            g_alpha_trunc = float(epitope_configs.get("alpha_trunc", 0.5))
             g_alpha_schedule_fn = make_cosine_trunc(
                 omega_init=g_alpha_init, tau_trunc=g_alpha_trunc
             )
-            # First step at which alpha is forced to 0 (s = step/(total-1) >= tau).
-            _off_step = math.ceil(g_alpha_trunc * (g_total_steps - 1)) if g_total_steps > 1 else 0
-            _alpha_desc = (
-                f"alpha=cosine_trunc(omega_init={g_alpha_init:.3f}, "
-                f"tau_trunc={g_alpha_trunc:.3f}; off at step {_off_step}/{g_total_steps})"
-            )
-
-        g_d0 = float(guidance_kwargs.get("d0", 4.0))
-        g_beta = float(guidance_kwargs.get("softmin_beta", 10.0))
-        g_top_k = guidance_kwargs.get("top_k", None)
-        g_lambda_clash = float(guidance_kwargs.get("lambda_clash", 0.0))
-        g_clash_tau = float(guidance_kwargs.get("clash_tau", 1.5))
-        g_clash_start_step = int(guidance_kwargs.get("clash_start_step", 0))
+        g_d0 = float(epitope_configs.get("d0", 4.0))
+        g_beta = float(epitope_configs.get("softmin_beta", 10.0))
+        g_lambda_clash = float(epitope_configs.get("lambda_clash", 0.0))
+        g_clash_tau = float(epitope_configs.get("clash_tau", 1.5))
+        g_clash_start_step = int(epitope_configs.get("clash_start_step", 0))
         g_clash_on = g_lambda_clash > 0.0
+        # Optional per-step, per-sample reward trace. The caller passes a list and
+        # we append to it in place; it is dumped alongside the predictions so the
+        # steering of each sample can be inspected (and compared across chunk
+        # sizes) instead of only surviving as a log line every 50 steps.
+        g_trace = epitope_configs.get("trace", None)
+        # Reward/backprop cadence. 1 (default) = every step, which is the
+        # pre-interval behaviour bit-for-bit: `step_i % 1 == 0` is True for
+        # every int, so the gate below collapses to `cur_alpha != 0.0`.
+        # k > 1 steers steps 0, k, 2k, ... and lets the rest fall through to
+        # the frozen-embedding branch (one no-grad denoise, no backward).
+        _raw_interval = epitope_configs.get("guidance_interval", 8)
+        try:
+            g_interval = int(_raw_interval)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "epitope.guidance_interval must be an integer >= 1, got "
+                f"{_raw_interval!r}."
+            )
+        if g_interval < 1:
+            # Raise, never clamp. 0 would raise ZeroDivisionError ~200 steps
+            # into a GPU job, and -3 would run as exactly 3 with no error at
+            # all (in Python, a % -b == 0 iff b divides a) -- a benchmark row
+            # labelled with a value the run never used.
+            raise ValueError(
+                "epitope.guidance_interval must be >= 1 (1 = steer every step); "
+                f"got {g_interval}. Use --gating.mode raw to disable steering."
+            )
+        # The steps that will actually apply the reward gradient. Evaluated with
+        # the SAME predicate as the loop gate below, so the two cannot drift.
+        # ceil(N/k) would be wrong: the cadence and the alpha schedule are
+        # independent gates, and with `--epitope.guidance_alpha null` the cosine
+        # truncates alpha to 0 from step tau_trunc*(N-1) onward -- at
+        # alpha_trunc=0.5 that already halves the count at interval=1. Reporting
+        # ceil(N/k) would overstate the steering density the operator is
+        # calibrating against, on the default path too. N is a few hundred, so
+        # materialising the list is free.
+        g_steer_steps = [
+            _i
+            for _i in range(g_total_steps)
+            if _i % g_interval == 0
+            and (
+                g_alpha_const
+                if g_alpha_const is not None
+                else g_alpha_schedule_fn(_i, g_total_steps)
+            )
+            != 0.0
+        ]
+        g_n_steer = len(g_steer_steps)
         logger.info(
-            "Guidance ON: %s, d0=%.1f, softmin_beta=%.1f, lambda_clash=%.3f, clash_tau=%.2f, clash_start_step=%d",
-            _alpha_desc, g_d0, g_beta, g_lambda_clash, g_clash_tau, g_clash_start_step,
+            "Epitope embedding-guidance ON: d0=%.2f softmin_beta=%.2f "
+            "λ_clash=%.3f alpha_const=%s (schedule=%s) "
+            "interval=%d (%d/%d steps steer)",
+            g_d0, g_beta, g_lambda_clash,
+            g_alpha_const, g_alpha_schedule_fn is not None,
+            g_interval, g_n_steer, g_total_steps,
         )
+        if g_interval > 1:
+            logger.warning(
+                "epitope.guidance_interval=%d: only %d of %d steps apply the "
+                "reward gradient. The per-update step size (guidance_alpha) is "
+                "unchanged, so the TOTAL steering over the trajectory is ~1/%d "
+                "of an interval=1 run. This is a guidance change, not only a "
+                "speedup -- validate on DockQ before trusting the output.",
+                g_interval, g_n_steer, g_total_steps, g_interval,
+            )
+        if g_clash_on:
+            # The clash term is gated by BOTH `epitope_active` and
+            # `step_i >= clash_start_step`, which cut along different axes. Their
+            # intersection can be empty -- e.g. clash_start_step=190 with
+            # interval=20 (last steered step 180), or a clash_start_step past the
+            # last pre-truncation steered step. The run would then be identical
+            # to lambda_clash=0.0 while still logging "λ_clash=0.100", so say so.
+            g_n_clash = sum(1 for _i in g_steer_steps if _i >= g_clash_start_step)
+            if g_n_clash == 0:
+                logger.warning(
+                    "epitope.lambda_clash=%.3f is set but the clash term will "
+                    "NEVER be applied: no steered step is >= clash_start_step=%d "
+                    "(steered steps run %s, interval=%d). This run is equivalent "
+                    "to lambda_clash=0.0 -- lower clash_start_step or interval.",
+                    g_lambda_clash, g_clash_start_step,
+                    "none" if not g_steer_steps
+                    else f"{g_steer_steps[0]}..{g_steer_steps[-1]}",
+                    g_interval,
+                )
+            elif g_interval > 1:
+                logger.info(
+                    "  clash term applies on %d of %d steered steps.",
+                    g_n_clash, g_n_steer,
+                )
+    else:
+        g_trace = None
 
-    total_steps = len(noise_schedule) - 1
+    def _chunk_sample_diffusion(chunk_n_sample, inplace_safe, sample_offset=0):
+        # init noise
+        # [..., N_sample, N_atom, 3]
+        x_l = noise_schedule[0] * torch.randn(
+            size=(*batch_shape, chunk_n_sample, N_atom, 3), device=device, dtype=dtype
+        )  # NOTE: set seed in distributed training
 
-    def _chunk_sample_diffusion(chunk_n_sample, inplace_safe):
-        trajectory_frames = [] if save_trajectory else None
-        trajectory_rotations = [] if save_trajectory else None
-        # Per-chunk reward list; appended to reward_buffer at end.
-        chunk_rewards = [] if (guidance_on and reward_buffer is not None) else None
         # ---- steerable local copies of trunk embeddings ----
-        if guidance_on:
-            s_tau = s_trunk.detach().clone()
-            z_tau = z_trunk.detach().clone()
-            # When guidance is on, pair_z / p_lm / c_l are None so the
-            # diffusion module recomputes them from z_tau each step.
+        # When epitope guidance is on, s_tau/z_tau are updated each step by the
+        # RMS-normalized reward gradient. Trunk-derived caches (pair_z/p_lm/c_l)
+        # are invalidated because they depend on z_trunk which is now moving.
+        if epitope_on:
+            # Per-sample steering. Every sample in the chunk gets its OWN
+            # (s_tau, z_tau) trajectory, carried on a dedicated leading axis.
+            #
+            # This is the whole point of the change: without that axis a chunk
+            # shares one steered embedding driven by the chunk-AVERAGED reward,
+            # so samples that want opposite corrections cancel each other and the
+            # steering signal dies. That is why production pinned
+            # sample_diffusion_chunk_size to 1 -- it bought per-sample steering by
+            # giving up the batch dimension. With the axis present, backprop of
+            # the SUMMED reward gives d(sum_i r_i)/d s_tau[j] = d r_j / d s_tau[j],
+            # so the samples stay separated and the batch dimension comes back.
+            if z_trunk is None:
+                raise ValueError(
+                    "Epitope steering needs the raw z_trunk to steer, but it was "
+                    "None -- the caller passed a precomputed pair_z cache. The "
+                    "steered branch must skip that cache (protenix.py: the "
+                    "`and not steer` guard on enable_diffusion_shared_vars_cache)."
+                )
+            s_tau = expand_at_dim(
+                s_trunk.detach(), dim=-3, n=chunk_n_sample
+            ).contiguous()  # [..., N_sample, N_token, c_s]
+            z_tau = expand_at_dim(
+                z_trunk.detach(), dim=-4, n=chunk_n_sample
+            ).contiguous()  # [..., N_sample, N_token, N_token, c_z]
+            # Trunk-derived caches depend on z_trunk, which is now moving AND
+            # per-sample, so they must not be reused.
             cur_pair_z = None
             cur_p_lm = None
             cur_c_l = None
@@ -257,46 +365,22 @@ def sample_diffusion(
             cur_p_lm = p_lm
             cur_c_l = c_l
 
-        # init noise  [..., N_sample, N_atom, 3]
-        x_l = noise_schedule[0] * torch.randn(
-            size=(*batch_shape, chunk_n_sample, N_atom, 3), device=device, dtype=dtype
-        )
-
-        # Cumulative rotation applied by centre_random_augmentation across steps.
-        # Kept in fp32 to avoid orthogonality drift over hundreds of matmuls.
-        if save_trajectory:
-            R_cum = (
-                torch.eye(3, device=device, dtype=torch.float32)
-                .expand(*batch_shape, chunk_n_sample, 3, 3)
-                .contiguous()
-            )
-        else:
-            R_cum = None
-
         # Logging latch only: prints the guidance->frozen transition message
         # exactly once. It does NOT control freezing — that is decided per step
-        # by `guidance_active` (cur_alpha != 0) below.
+        # by `epitope_active` (cur_alpha != 0) below.
         truncation_logged = False
 
-        for step_idx, (c_tau_last, c_tau) in enumerate(
+        for step_i, (c_tau_last, c_tau) in enumerate(
             zip(noise_schedule[:-1], noise_schedule[1:])
         ):
             # [..., N_sample, N_atom, 3]
-            if save_trajectory:
-                x_l, R_step = centre_random_augmentation(
-                    x_input_coords=x_l, N_sample=1, return_transform=True,
-                )
-                x_l = x_l.squeeze(dim=-3).to(dtype)
-                # R_step: [..., 1, 3, 3] → [..., chunk_n_sample, 3, 3]
-                R_step = R_step.squeeze(dim=-3).to(torch.float32).detach()
-                R_cum = torch.matmul(R_step, R_cum)
-            else:
-                x_l = (
-                    centre_random_augmentation(x_input_coords=x_l, N_sample=1)
-                    .squeeze(dim=-3)
-                    .to(dtype)
-                )
+            x_l = (
+                centre_random_augmentation(x_input_coords=x_l, N_sample=1)
+                .squeeze(dim=-3)
+                .to(dtype)
+            )
 
+            # Denoise with a predictor-corrector sampler
             # 1. Add noise to move x_{c_tau_last} to x_{t_hat}
             gamma = float(gamma0) if c_tau > gamma_min else 0
             t_hat = c_tau_last * (gamma + 1)
@@ -307,32 +391,51 @@ def sample_diffusion(
             )
 
             # 2. Denoise from x_{t_hat} to x_{c_tau}
+            # Euler step only
             t_hat = (
                 t_hat.reshape((1,) * (len(batch_shape) + 1))
                 .expand(*batch_shape, chunk_n_sample)
                 .to(dtype)
             )
 
-            # Decide this step's steering weight *before* the forward pass. Once
-            # the cosine schedule truncates (cur_alpha == 0) there is nothing to
-            # gain from the grad-enabled forward + autograd — skip it and fall
-            # through to the plain (frozen-embedding) run below.
-            if guidance_on:
-                if g_alpha_const is not None:
-                    cur_alpha = g_alpha_const
-                else:
-                    cur_alpha = g_alpha_schedule_fn(step_idx, g_total_steps)
-                guidance_active = cur_alpha != 0.0
+            # SteerABLE: decide this step's steering weight *before* the forward
+            # pass. Once the cosine schedule truncates (cur_alpha == 0) there is
+            # nothing to gain from the grad-enabled forward + autograd — the old
+            # code still ran the full forward and merely scaled the update by 0.
+            # Instead we fall through to the plain (frozen-embedding) run below.
+            if epitope_on:
+                cur_alpha = (
+                    g_alpha_const
+                    if g_alpha_const is not None
+                    else g_alpha_schedule_fn(step_i, g_total_steps)
+                )
+                # Two gates, ANDed. (1) `cur_alpha != 0.0` is untouched -- the
+                # cosine schedule may have truncated alpha, in which case there
+                # is nothing to apply. (2) the new cadence gate. alpha is still
+                # sampled at the RAW step_i (never at a guidance-event counter),
+                # so the schedule's truncation point and `clash_start_step` keep
+                # their step-space meaning; the interval only thins the steered
+                # set to {0, k, 2k, ...}. Phase 0 (not k-1) means step 0 always
+                # steers: the cosine peak is at s=0, and because s_tau/z_tau
+                # persist, an early update conditions every remaining denoise.
+                # g_interval == 1 makes the second conjunct a constant True, so
+                # this is the same value AND the same bool type as before.
+                epitope_active = cur_alpha != 0.0 and step_i % g_interval == 0
             else:
-                guidance_active = False
+                epitope_active = False
 
-            if guidance_active:
-                # ---- guided step: grad-enabled forward ----
+            if epitope_active:
+                # ==== SteerABLE-v1 epitope-reward-guided branch ====
+                # x̂0 is the denoiser's own output (Protenix-v1 has no TFG stage
+                # to route it through), so the graph runs denoise_net -> reward
+                # -> (s_tau, z_tau) directly.
                 s_tau = s_tau.detach().requires_grad_(True)
                 z_tau = z_tau.detach().requires_grad_(True)
 
                 with torch.enable_grad():
-                    x_denoised = denoise_net(
+                    # Grad-enabled denoise on the steered embeddings, then the plain
+                    # AF3 Euler step (Alg. 18 line 9) on the detached x̂0 below.
+                    x0_pred = denoise_net(
                         x_noisy=x_noisy,
                         t_hat_noise_level=t_hat,
                         input_feature_dict=input_feature_dict,
@@ -346,119 +449,188 @@ def sample_diffusion(
                         inplace_safe=False,
                         enable_efficient_fusion=False,
                     )
+                    delta = (x_noisy - x0_pred) / t_hat[..., None, None]
+                    dt = c_tau - t_hat
+                    x_next = x_noisy + step_scale_eta * dt[..., None, None] * delta
 
-                    # cur_alpha computed above (before the forward pass).
-                    reward_contact = contact_epitope_reward(
-                        coords=x_denoised,
+                    # Reward evaluated on grad-attached x̂0 (not on x_next which
+                    # is Euler-stepped noisy waypoint). Backprop to s_tau/z_tau.
+                    # Per-sample rewards: shape [N_sample], NOT a scalar. Keeping
+                    # the sample axis is what stops one sample's reward from
+                    # reaching another sample's embedding.
+                    r_contact = contact_epitope_reward(
+                        coords=x0_pred,
                         mask_pairs=g_mask_pairs,
                         d0=g_d0,
                         softmin_beta=g_beta,
-                        top_k=g_top_k,
+                        top_k=CONTACT_TOP_K,
+                        per_sample=True,
                     )
-                    if g_clash_on and step_idx >= g_clash_start_step:
-                        reward_clash = epitope_clash_reward(
-                            coords=x_denoised,
+                    if g_clash_on and step_i >= g_clash_start_step:
+                        r_clash = epitope_clash_reward(
+                            coords=x0_pred,
                             mask_pairs=g_mask_pairs,
                             ref_element=input_feature_dict["ref_element"],
                             tau=g_clash_tau,
+                            per_sample=True,
                         )
-                        reward = reward_contact + g_lambda_clash * reward_clash
+                        reward = r_contact + g_lambda_clash * r_clash
                     else:
-                        reward_clash = None
-                        reward = reward_contact
+                        r_clash = None
+                        reward = r_contact
 
+                    # Differentiating the SUM separates the samples exactly:
+                    #   d(sum_i r_i)/d s_tau[j] = d r_j / d s_tau[j]
+                    # because r_i depends only on s_tau[i]. No cross terms exist,
+                    # so this is the serial (chunk_size=1) update, batched.
                     grads = torch.autograd.grad(
-                        outputs=reward,
-                        inputs=[s_tau, z_tau],
+                        reward.sum(),
+                        [s_tau, z_tau],
                         create_graph=False,
                         allow_unused=True,
                     )
                     g_s = grads[0] if grads[0] is not None else torch.zeros_like(s_tau)
                     g_z = grads[1] if grads[1] is not None else torch.zeros_like(z_tau)
 
-                # RMS-normalise and update embeddings
-                g_s_bar = rms_normalize(g_s)
-                g_z_bar = rms_normalize(g_z)
-                s_tau = (s_tau.detach() + cur_alpha * g_s_bar).detach()
-                z_tau = (z_tau.detach() + cur_alpha * g_z_bar).detach()
+                # Embedding update — RMS-normalised α-step (cur_alpha from above).
+                # The RMS is taken PER SAMPLE; a global RMS would re-couple the
+                # samples through the denominator and make a sample with a larger
+                # gradient take a larger step than it does when run alone.
+                s_tau = (
+                    s_tau.detach() + cur_alpha * rms_normalize(g_s, sample_dim=-3)
+                ).detach()
+                z_tau = (
+                    z_tau.detach() + cur_alpha * rms_normalize(g_z, sample_dim=-4)
+                ).detach()
+                x_l = x_next.detach()
 
-                x_denoised = x_denoised.detach()
+                if g_trace is not None:
+                    g_trace.append(
+                        {
+                            "step": step_i,
+                            # index of this chunk's first sample in the full
+                            # N_sample stack, so traces from different chunk
+                            # sizes line up sample-for-sample
+                            "sample_offset": sample_offset,
+                            "alpha": cur_alpha,
+                            "reward": reward.detach().flatten().tolist(),
+                            "contact": r_contact.detach().flatten().tolist(),
+                            "clash": (
+                                None if r_clash is None
+                                else r_clash.detach().flatten().tolist()
+                            ),
+                        }
+                    )
 
-                # Capture scalar reward for this step (chunk-level, averaged over samples)
-                if chunk_rewards is not None:
-                    chunk_rewards.append(float(reward.item()))
+                # First steered step of each 50-step window. At g_interval == 1
+                # `step_i % 50 < 1` is `step_i % 50 == 0` over non-negative
+                # ints, i.e. steps 0/50/100/150 exactly as before. Keeping the
+                # old test would collapse the reward trace to multiples of
+                # lcm(50, k): k=3 logs twice in 200 steps, k=4 twice, k=7 once --
+                # unusable for comparing the very runs this knob exists for.
+                if step_i % 50 < g_interval:
+                    logger.info(
+                        "  step %d: reward=%.4f%s alpha=%.6f |g_s|=%.4f |g_z|=%.4f "
+                        "per_sample=%s",
+                        step_i, float(reward.mean().item()),
+                        "" if r_clash is None
+                        else " (contact=%.4f clash=%.4f)"
+                        % (r_contact.mean().item(), r_clash.mean().item()),
+                        cur_alpha, g_s.norm().item(), g_z.norm().item(),
+                        "[" + ", ".join(f"{v:.4f}" for v in reward.detach().flatten().tolist()) + "]",
+                    )
 
-                if step_idx % 50 == 0:
-                    if reward_clash is not None:
-                        logger.info(
-                            "  step %d: reward=%.4f (contact=%.4f, clash=%.4f, λ_clash=%.3f), alpha=%.6f, |g_s|=%.6f, |g_z|=%.6f, top_k=%s",
-                            step_idx, reward.item(), reward_contact.item(), reward_clash.item(),
-                            g_lambda_clash, cur_alpha, g_s.norm().item(), g_z.norm().item(),
-                            g_top_k,
-                        )
-                    else:
-                        logger.info(
-                            "  step %d: reward=%.4f, alpha=%.6f, |g_s|=%.6f, |g_z|=%.6f, top_k=%s",
-                            step_idx, reward.item(), cur_alpha, g_s.norm().item(), g_z.norm().item(),
-                            g_top_k,
-                        )
+            elif epitope_on:
+                # ==== SteerABLE step with NO reward / autograd / update ====
+                # Two disjoint reasons land here; the work is identical either
+                # way, but they mean different things and must not be reported
+                # as each other:
+                #   (1) TRUNCATED    -- the cosine schedule hit tau_trunc, so
+                #       alpha is 0 for this and every remaining step. Permanent.
+                #   (2) OFF-CADENCE  -- guidance_interval = k > 1 and step_i is
+                #       not a multiple of k. Temporary: more steered steps
+                #       follow at the next multiple of k.
+                # Either way: skip the grad-enabled forward + reward + autograd
+                # and run the plain sampler on the current (already-steered)
+                # embeddings. That is the runtime win -- one no-grad forward
+                # instead of forward + reward + backprop.
+                # NOTE: s_tau/z_tau are deliberately NOT reset to
+                # s_trunk/z_trunk. The accumulated steering offset persists
+                # across skipped steps, which is what makes the interval a
+                # cadence knob rather than an alpha knob.
+                s_tau = s_tau.detach()
+                z_tau = z_tau.detach()
+                if cur_alpha == 0.0 and not truncation_logged:
+                    # One-time notice, and ONLY for a real truncation. An
+                    # off-cadence step is not a truncation, so firing this here
+                    # would print "truncated at step 1 (alpha=0)" on every
+                    # interval>1 run (alpha is 0.1, nothing is truncated) and
+                    # would then permanently suppress the real message on a
+                    # cosine-schedule run. The cadence is reported once at
+                    # setup instead. The freeze itself was decided above by
+                    # epitope_active, not by this flag.
+                    logger.info(
+                        "Epitope guidance truncated at step %d (alpha=0); running "
+                        "remaining steps on frozen steered embeddings (no autograd).",
+                        step_i,
+                    )
+                    truncation_logged = True
+
+                # Plain AF3 Euler step on the frozen steered embeddings.
+                # no_grad is what makes this the runtime win the comment
+                # above promises: grad is enabled process-wide while epitope
+                # guidance is configured, so without it the denoiser still
+                # builds a graph through its parameters — which also leaves
+                # x_l requiring grad and makes the dumper fail on
+                # `pred_coordinate.cpu().numpy()`.
+                with torch.no_grad():
+                    x_denoised = denoise_net(
+                        x_noisy=x_noisy,
+                        t_hat_noise_level=t_hat,
+                        input_feature_dict=input_feature_dict,
+                        s_inputs=s_inputs,
+                        s_trunk=s_tau,
+                        z_trunk=z_tau,
+                        pair_z=cur_pair_z,
+                        p_lm=cur_p_lm,
+                        c_l=cur_c_l,
+                        chunk_size=attn_chunk_size,
+                        inplace_safe=inplace_safe,
+                        enable_efficient_fusion=enable_efficient_fusion,
+                    )
+                    delta = (x_noisy - x_denoised) / t_hat[..., None, None]
+                    dt = c_tau - t_hat
+                    x_l = x_noisy + step_scale_eta * dt[..., None, None] * delta
+
             else:
-                # ---- plain path: genuinely unguided, OR guidance truncated ----
-                # When guidance_on and we reach here, the cosine schedule has
-                # truncated (cur_alpha == 0): skip the grad forward + autograd and
-                # run a single plain denoise on the *frozen* steered embeddings.
-                if guidance_on:
-                    s_tau = s_tau.detach()
-                    z_tau = z_tau.detach()
-                    if not truncation_logged:
-                        logger.info(
-                            "Guidance truncated at step %d (alpha=0); running "
-                            "remaining steps on frozen steered embeddings (no autograd).",
-                            step_idx,
-                        )
-                        truncation_logged = True
+                # ==== Baseline branch (unchanged from upstream Protenix-v1) ====
                 x_denoised = denoise_net(
                     x_noisy=x_noisy,
                     t_hat_noise_level=t_hat,
                     input_feature_dict=input_feature_dict,
                     s_inputs=s_inputs,
-                    s_trunk=s_tau,
-                    z_trunk=z_tau,
-                    pair_z=cur_pair_z,
-                    p_lm=cur_p_lm,
-                    c_l=cur_c_l,
+                    s_trunk=s_trunk,
+                    z_trunk=z_trunk,
+                    pair_z=pair_z,
+                    p_lm=p_lm,
+                    c_l=c_l,
                     chunk_size=attn_chunk_size,
                     inplace_safe=inplace_safe,
                     enable_efficient_fusion=enable_efficient_fusion,
                 )
 
-            # Euler step: coordinate update
-            delta = (x_noisy - x_denoised) / t_hat[
-                ..., None, None
-            ]  # Line 9 of AF3 uses 'x_l_hat' instead, which we believe is a typo.
-            dt = c_tau - t_hat
-            x_l = x_noisy + step_scale_eta * dt[..., None, None] * delta
+                delta = (x_noisy - x_denoised) / t_hat[
+                    ..., None, None
+                ]  # Line 9 of AF3 uses 'x_l_hat' instead, which we believe  is a typo.
+                dt = c_tau - t_hat
+                x_l = x_noisy + step_scale_eta * dt[..., None, None] * delta
 
-            # ---- trajectory capture (every step) ----
-            if trajectory_frames is not None:
-                trajectory_frames.append(x_l.detach().cpu())
-                trajectory_rotations.append(R_cum.detach().cpu())
-
-        # Side-channel: push this chunk's reward list into the caller-provided buffer.
-        # The return signature below stays unchanged.
-        if chunk_rewards is not None:
-            reward_buffer.append(chunk_rewards)
-
-        if trajectory_frames is not None:
-            return x_l, trajectory_frames, trajectory_rotations
         return x_l
 
     if diffusion_chunk_size is None:
-        result = _chunk_sample_diffusion(N_sample, inplace_safe=inplace_safe)
+        x_l = _chunk_sample_diffusion(N_sample, inplace_safe=inplace_safe)
     else:
-        x_l_chunks = []
-        traj_chunks = [] if save_trajectory else None
-        rot_chunks = [] if save_trajectory else None
+        x_l = []
         no_chunks = N_sample // diffusion_chunk_size + (
             N_sample % diffusion_chunk_size != 0
         )
@@ -468,30 +640,14 @@ def sample_diffusion(
                 if i < no_chunks - 1
                 else N_sample - i * diffusion_chunk_size
             )
-            result = _chunk_sample_diffusion(
-                chunk_n_sample, inplace_safe=inplace_safe
+            chunk_x_l = _chunk_sample_diffusion(
+                chunk_n_sample,
+                inplace_safe=inplace_safe,
+                sample_offset=i * diffusion_chunk_size,
             )
-            if save_trajectory:
-                chunk_x_l, chunk_traj, chunk_rot = result
-                x_l_chunks.append(chunk_x_l)
-                traj_chunks.append(chunk_traj)
-                rot_chunks.append(chunk_rot)
-            else:
-                x_l_chunks.append(result)
-        x_l = torch.cat(x_l_chunks, -3)  # [..., N_sample, N_atom, 3]
-        if save_trajectory:
-            # merge chunk trajectories + rotations along sample axis (-3 for coords,
-            # -3 for R whose shape is [..., N_sample, 3, 3]).
-            n_frames = len(traj_chunks[0])
-            merged_traj = []
-            merged_rot = []
-            for f in range(n_frames):
-                merged_traj.append(torch.cat([tc[f] for tc in traj_chunks], dim=-3))
-                merged_rot.append(torch.cat([rc[f] for rc in rot_chunks], dim=-3))
-            result = (x_l, merged_traj, merged_rot)
-        else:
-            result = x_l
-    return result
+            x_l.append(chunk_x_l)
+        x_l = torch.cat(x_l, -3)  # [..., N_sample, N_atom, 3]
+    return x_l
 
 
 def sample_diffusion_training(

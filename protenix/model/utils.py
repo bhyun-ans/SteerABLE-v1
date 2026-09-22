@@ -20,6 +20,11 @@ import numpy as np
 import optree
 import torch
 import torch.nn as nn
+
+# `import torch` alone does not bind the `checkpoint` submodule onto `torch.utils`
+# (torch 2.7), so get_checkpoint_fn() below raises AttributeError unless something
+# else in the process happened to import it first.
+import torch.utils.checkpoint  # noqa: F401  (needed by get_checkpoint_fn)
 from scipy.spatial.transform import Rotation
 
 from protenix.utils.scatter_utils import scatter
@@ -32,8 +37,7 @@ def centre_random_augmentation(
     centre_only: bool = False,
     mask: Optional[torch.Tensor] = None,
     eps: float = 1e-12,
-    return_transform: bool = False,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+) -> torch.Tensor:
     """Implements Algorithm 19 in AF3
 
     Args:
@@ -45,13 +49,9 @@ def centre_random_augmentation(
         mask (torch.Tensor, optional): masking for the coords
             [..., N_atom]
         eps (float, optional): small number used for masked mean
-        return_transform (bool, optional): if True, also return the applied rotation
-            matrix (identity in the ``centre_only`` path). Defaults to False.
     Returns:
         torch.Tensor:  the Augmentation version of input coords
             [..., N_sample, N_atom, 3]
-        If return_transform=True, also returns the rotation matrix with shape
-            [..., N_sample, 3, 3]
     """
 
     N_atom = x_input_coords.size(-2)
@@ -70,22 +70,15 @@ def centre_random_augmentation(
 
     # Expand to [..., N_sample, N_atom, 3]
     x_input_coords = expand_at_dim(x_input_coords, dim=-3, n=N_sample)
-    batch_size_shape = x_input_coords.shape[:-3]
 
     if centre_only:
-        if return_transform:
-            identity_R = (
-                torch.eye(3, device=device, dtype=x_input_coords.dtype)
-                .expand(*batch_size_shape, N_sample, 3, 3)
-                .contiguous()
-            )
-            return x_input_coords, identity_R
         return x_input_coords
 
     # N_augment = batch_size * N_sample
     N_augment = torch.numel(x_input_coords[..., 0, 0])
 
     # Generate N_augment (rot, trans) pairs
+    batch_size_shape = x_input_coords.shape[:-3]
     rot_matrix_random = (
         uniform_random_rotation(N_sample=N_augment)
         .to(device)
@@ -103,8 +96,6 @@ def centre_random_augmentation(
 
     if mask is not None:
         x_augment_coords = x_augment_coords * mask[..., None, :, None]
-    if return_transform:
-        return x_augment_coords, rot_matrix_random
     return x_augment_coords
 
 

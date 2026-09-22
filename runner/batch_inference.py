@@ -37,6 +37,7 @@ from protenix.data.inference.json_maker import cif_to_input_json
 from protenix.data.inference.json_parser import lig_file_to_atom_info
 from protenix.data.utils import pdb_to_cif
 from protenix.utils.logger import get_logger
+from protenix.version import __version__
 from rdkit import Chem
 
 from runner.inference import (
@@ -301,6 +302,12 @@ def get_default_runner(
     use_seeds_in_json: bool = False,
     need_atom_confidence: bool = False,
     kalign_binary_path: Optional[str] = None,
+    ab_chains: Optional[str] = None,
+    epitope_residue: Optional[str] = None,
+    epitope_guidance_alpha: float = 0.1,
+    epitope_lambda_clash: float = 0.1,
+    epitope_guidance_interval: int = 8,
+    gating_mode: str = "steerable",
 ) -> InferenceRunner:
     """
     Get a default InferenceRunner with the specified configurations.
@@ -322,6 +329,16 @@ def get_default_runner(
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds defined in the JSON file.
         kalign_binary_path (Optional[str]): Path to kalign binary.
+        ab_chains (Optional[str]): Antibody/binder chains, e.g. "A,B". Required
+            when epitope_residue is set; the antigen is the complement.
+        epitope_residue (Optional[str]): Epitope residues to steer towards,
+            e.g. "C:45,C:48,C:52". ';' separates independent epitope sets, each
+            of which gets its own steered branch off one shared trunk. Setting
+            this turns epitope steering on; leaving it unset runs plain Protenix.
+        epitope_guidance_alpha (float): Steering step size. 0.1 recommended.
+        epitope_lambda_clash (float): Weight of the Ab-Ag clash penalty. 0 disables.
+        epitope_guidance_interval (int): Steer on every k-th diffusion step.
+        gating_mode (str): steerable | both | route | raw.
 
     Returns:
         InferenceRunner: An instance of InferenceRunner.
@@ -399,6 +416,37 @@ def get_default_runner(
                     "After installation, make sure the binary is accessible in PATH or provide kalign_binary_path."
                 )
 
+    # ---- SteerABLE-v1 epitope steering ----
+    # `epitope_residue` is the on/off switch. The remaining knobs already carry
+    # their recommended values as config defaults (configs/configs_inference.py);
+    # what is set here are the CLI overrides of those defaults.
+    if epitope_residue:
+        if not ab_chains:
+            raise RuntimeError(
+                "--epitope_residue needs --ab_chains (e.g. 'A,B') so the "
+                "antibody/binder side of the interface can be identified; the "
+                "antigen is taken to be every other chain."
+            )
+        configs.epitope_residue = epitope_residue
+        configs.ab_chains = ab_chains
+        configs.epitope.guidance_alpha = epitope_guidance_alpha
+        configs.epitope.lambda_clash = epitope_lambda_clash
+        configs.epitope.guidance_interval = epitope_guidance_interval
+        configs.gating.mode = gating_mode
+        n_sets = len([x for x in epitope_residue.split(";") if x.strip()])
+        logger.info(
+            f"SteerABLE-v1 epitope steering ON: ab_chains={ab_chains}, "
+            f"{n_sets} epitope set(s), alpha={epitope_guidance_alpha}, "
+            f"lambda_clash={epitope_lambda_clash}, "
+            f"guidance_interval={epitope_guidance_interval}, "
+            f"gating.mode={gating_mode}"
+        )
+    elif ab_chains:
+        logger.warning(
+            "--ab_chains was given without --epitope_residue, so nothing will "
+            "be steered and this run is plain Protenix."
+        )
+
     configs = update_gpu_compatible_configs(configs)
     logger.info(
         f"Inference by Protenix: model_size: {model_size}, "
@@ -439,6 +487,12 @@ def inference_jsons(
     use_seeds_in_json: bool = False,
     need_atom_confidence: bool = False,
     kalign_binary_path: Optional[str] = None,
+    ab_chains: Optional[str] = None,
+    epitope_residue: Optional[str] = None,
+    epitope_guidance_alpha: float = 0.1,
+    epitope_lambda_clash: float = 0.1,
+    epitope_guidance_interval: int = 8,
+    gating_mode: str = "steerable",
     hmmsearch_binary_path: Optional[str] = None,
     hmmbuild_binary_path: Optional[str] = None,
     seqres_database_path: Optional[str] = None,
@@ -473,6 +527,16 @@ def inference_jsons(
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds from JSON.
         kalign_binary_path (Optional[str]): Path to kalign binary.
+        ab_chains (Optional[str]): Antibody/binder chains, e.g. "A,B". Required
+            when epitope_residue is set; the antigen is the complement.
+        epitope_residue (Optional[str]): Epitope residues to steer towards,
+            e.g. "C:45,C:48,C:52". ';' separates independent epitope sets, each
+            of which gets its own steered branch off one shared trunk. Setting
+            this turns epitope steering on; leaving it unset runs plain Protenix.
+        epitope_guidance_alpha (float): Steering step size. 0.1 recommended.
+        epitope_lambda_clash (float): Weight of the Ab-Ag clash penalty. 0 disables.
+        epitope_guidance_interval (int): Steer on every k-th diffusion step.
+        gating_mode (str): steerable | both | route | raw.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.
         hmmbuild_binary_path (Optional[str]): Path to hmmbuild binary.
         seqres_database_path (Optional[str]): Path to sequence database.
@@ -520,6 +584,12 @@ def inference_jsons(
         use_seeds_in_json=use_seeds_in_json,
         need_atom_confidence=need_atom_confidence,
         kalign_binary_path=kalign_binary_path,
+        ab_chains=ab_chains,
+        epitope_residue=epitope_residue,
+        epitope_guidance_alpha=epitope_guidance_alpha,
+        epitope_lambda_clash=epitope_lambda_clash,
+        epitope_guidance_interval=epitope_guidance_interval,
+        gating_mode=gating_mode,
     )
     configs = runner.configs
     for _, infer_json in enumerate(tqdm.tqdm(infer_jsons)):
@@ -572,13 +642,16 @@ class SuggestGroup(click.Group):
 
 
 @click.group(cls=SuggestGroup, context_settings=CONTEXT_SETTINGS)
-@click.version_option(version="1.0.5")
+@click.version_option(version=__version__)
 def protenix_cli() -> None:
     """
-    Protenix: A trainable reproduction of AlphaFold 3.
+    SteerABLE-v1: epitope-steered antibody-antigen structure prediction.
 
-    This CLI provides tools for structure prediction, data conversion,
-    and MSA/template searching.
+    Built on Protenix-v1. Without --epitope_residue this behaves exactly like
+    upstream Protenix; with it, the pairformer trunk embeddings are steered at
+    inference time towards the epitope you name.
+
+    This CLI also provides data conversion and MSA/template searching.
     """
     pass
 
@@ -682,6 +755,56 @@ def protenix_cli() -> None:
     help="Path to kalign (searches in PATH if not provided).",
 )
 @click.option(
+    "--ab_chains",
+    type=str,
+    default=None,
+    help=(
+        "Antibody/binder chains, e.g. 'A,B'. Required with --epitope_residue; "
+        "every other chain is treated as the antigen."
+    ),
+)
+@click.option(
+    "--epitope_residue",
+    type=str,
+    default=None,
+    help=(
+        "Epitope residues to steer towards, e.g. 'C:45,C:48,C:52'. Use ';' to "
+        "separate independent epitope sets, each of which is sampled as its own "
+        "branch off one shared trunk. Setting this turns epitope steering on."
+    ),
+)
+@click.option(
+    "--epitope_guidance_alpha",
+    type=float,
+    default=0.1,
+    help="Steering step size (recommended: 0.1).",
+)
+@click.option(
+    "--epitope_lambda_clash",
+    type=float,
+    default=0.1,
+    help="Weight of the antibody-antigen clash penalty; 0 disables it.",
+)
+@click.option(
+    "--epitope_guidance_interval",
+    type=int,
+    default=8,
+    help=(
+        "Apply the steering gradient on every k-th diffusion step. The default "
+        "8 was calibrated on Protenix-v2; the Protenix-v1 benchmarks used 1. "
+        "Total steering scales as ~1/k, so this is not a pure speed knob."
+    ),
+)
+@click.option(
+    "--gating_mode",
+    type=str,
+    default="steerable",
+    help=(
+        "Which branch(es) to sample: 'steerable' (steered only), 'both' "
+        "(steered + unguided raw off the same trunk), 'route', or 'raw'."
+    ),
+)
+@click.option(
     "--hmmsearch_binary_path",
     type=str,
     default=None,
@@ -763,6 +886,12 @@ def predict(
     use_seeds_in_json: bool,
     need_atom_confidence: bool,
     kalign_binary_path: Optional[str] = None,
+    ab_chains: Optional[str] = None,
+    epitope_residue: Optional[str] = None,
+    epitope_guidance_alpha: float = 0.1,
+    epitope_lambda_clash: float = 0.1,
+    epitope_guidance_interval: int = 8,
+    gating_mode: str = "steerable",
     hmmsearch_binary_path: Optional[str] = None,
     hmmbuild_binary_path: Optional[str] = None,
     seqres_database_path: Optional[str] = None,
@@ -799,6 +928,16 @@ def predict(
         use_seeds_in_json (bool): Use seeds from JSON.
         need_atom_confidence (bool): Compute atom-level confidence scores.
         kalign_binary_path (Optional[str]): Path to kalign binary.
+        ab_chains (Optional[str]): Antibody/binder chains, e.g. "A,B". Required
+            when epitope_residue is set; the antigen is the complement.
+        epitope_residue (Optional[str]): Epitope residues to steer towards,
+            e.g. "C:45,C:48,C:52". ';' separates independent epitope sets, each
+            of which gets its own steered branch off one shared trunk. Setting
+            this turns epitope steering on; leaving it unset runs plain Protenix.
+        epitope_guidance_alpha (float): Steering step size. 0.1 recommended.
+        epitope_lambda_clash (float): Weight of the Ab-Ag clash penalty. 0 disables.
+        epitope_guidance_interval (int): Steer on every k-th diffusion step.
+        gating_mode (str): steerable | both | route | raw.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.
         hmmbuild_binary_path (Optional[str]): Path to hmmbuild binary.
         seqres_database_path (Optional[str]): Path to sequence database.
@@ -912,6 +1051,12 @@ def predict(
         use_seeds_in_json=use_seeds_in_json,
         need_atom_confidence=need_atom_confidence,
         kalign_binary_path=kalign_binary_path,
+        ab_chains=ab_chains,
+        epitope_residue=epitope_residue,
+        epitope_guidance_alpha=epitope_guidance_alpha,
+        epitope_lambda_clash=epitope_lambda_clash,
+        epitope_guidance_interval=epitope_guidance_interval,
+        gating_mode=gating_mode,
         hmmsearch_binary_path=hmmsearch_binary_path,
         hmmbuild_binary_path=hmmbuild_binary_path,
         seqres_database_path=seqres_database_path,

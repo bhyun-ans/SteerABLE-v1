@@ -90,13 +90,19 @@ class DiffusionConditioning(nn.Module):
         inplace_safe: bool = False,
     ) -> torch.Tensor:
         # Pair conditioning
+        relpe = self.relpe(relp_feature)  # [..., N_tokens, N_tokens, c_z]
+        # z_trunk may carry a leading N_sample axis (per-sample epitope steering).
+        # relp_feature is a pure function of token indices and never does, and
+        # torch.cat does not broadcast, so match the rank explicitly.
+        if z_trunk.dim() == relpe.dim() + 1:
+            relpe = relpe.unsqueeze(-4).expand(*z_trunk.shape[:-1], -1)
         pair_z = torch.cat(
             tensors=[
                 z_trunk,
-                self.relpe(relp_feature),
+                relpe,
             ],
             dim=-1,
-        )  # [..., N_tokens, N_tokens, 2*c_z]
+        )  # [..., (N_sample), N_tokens, N_tokens, 2*c_z]
         pair_z = self.linear_no_bias_z(self.layernorm_z(pair_z))
         if inplace_safe:
             pair_z += self.transition_z1(pair_z)
@@ -153,21 +159,39 @@ class DiffusionConditioning(nn.Module):
             if inplace_safe:
                 pair_z_clone = pair_z.clone()
                 pair_z = pair_z_clone
-        # Single conditioning
+        # Single conditioning.
+        # s_trunk may carry a leading N_sample axis (per-sample epitope steering);
+        # s_inputs never does.  Detect that from the rank difference and align.
+        per_sample_trunk = s_trunk.dim() == s_inputs.dim() + 1
+        s_in = (
+            expand_at_dim(s_inputs, dim=-3, n=s_trunk.size(-3))
+            if per_sample_trunk
+            else s_inputs
+        )
         single_s = torch.cat(
-            tensors=[s_trunk, s_inputs], dim=-1
-        )  # [..., N_tokens, c_s + c_s_inputs]
+            tensors=[s_trunk, s_in], dim=-1
+        )  # [..., (N_sample), N_tokens, c_s + c_s_inputs]
         single_s = self.linear_no_bias_s(self.layernorm_s(single_s))
         noise_n = self.fourier_embedding(
             t_hat_noise_level=torch.log(input=t_hat_noise_level / self.sigma_data) / 4
         ).to(
             single_s.dtype
         )  # [..., N_sample, c_in]
-        single_s = single_s.unsqueeze(dim=-3) + self.linear_no_bias_n(
+        if not per_sample_trunk:
+            # Give the shared trunk a singleton sample axis to broadcast against.
+            # When it is already per-sample, unsqueezing here would silently
+            # produce [..., N_sample, N_sample, N_tokens, c_s] -- no exception,
+            # every sample mixed with every other sample's noise level.
+            single_s = single_s.unsqueeze(dim=-3)
+        single_s = single_s + self.linear_no_bias_n(
             self.layernorm_n(noise_n)
         ).unsqueeze(
             dim=-2
         )  # [..., N_sample, N_tokens, c_s]
+        assert single_s.size(-3) == noise_n.size(-2), (
+            f"sample axis mismatch: single_s {tuple(single_s.shape)} vs "
+            f"noise_n {tuple(noise_n.shape)}"
+        )
         if inplace_safe:
             single_s += self.transition_s1(single_s)
             single_s += self.transition_s2(single_s)
@@ -403,11 +427,18 @@ class DiffusionModule(nn.Module):
                 use_conditioning=use_conditioning,
             )  # [..., N_sample, N_token, c_s], [..., N_token, N_token, c_z]
 
-        # Expand embeddings to match N_sample
-        s_trunk = expand_at_dim(s_trunk, dim=-3, n=1)  # [..., N_sample, N_token, c_s]
-        z_pair = expand_at_dim(
-            z_pair, dim=-4, n=1
-        )  # [..., N_sample, N_token, N_token, c_z]
+        # Expand embeddings to match N_sample.
+        # n=1 only INSERTS a singleton axis and relies on broadcasting, which is
+        # why the shared trunk costs no extra memory.  When epitope steering runs
+        # per sample these already carry a real N_sample axis and must be left
+        # alone -- expanding again would insert a second one and broadcast wrong.
+        # s_inputs is the rank reference: it never carries a sample axis.
+        if s_trunk.dim() == s_inputs.dim():
+            s_trunk = expand_at_dim(s_trunk, dim=-3, n=1)  # [..., N_sample, N_token, c_s]
+        if z_pair.dim() == s_inputs.dim() + 1:
+            z_pair = expand_at_dim(
+                z_pair, dim=-4, n=1
+            )  # [..., N_sample, N_token, N_token, c_z]
         # Fine-grained checkpoint for finetuning stage 2 (token num: 768) for avoiding OOM
         if blocks_per_ckpt and self.use_fine_grained_checkpoint:
             checkpoint_fn = get_checkpoint_fn()

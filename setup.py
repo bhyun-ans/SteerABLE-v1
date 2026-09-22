@@ -18,6 +18,20 @@ from pathlib import Path
 from setuptools import find_packages, setup
 
 this_directory = Path(__file__).parent
+
+# Read version from version.py
+# NOTE: the importable package is still called `protenix`, on purpose -- this
+# tree is a fork of Protenix-v1 and keeping the module path identical is what
+# lets it be diffed and re-based against upstream. Only the distribution and
+# the console command are named `steerable-v1`.
+version_file = this_directory / "protenix" / "version.py"
+version_dict = {}
+if version_file.exists():
+    exec(version_file.read_text(), version_dict)
+    version = version_dict["__version__"]
+else:
+    version = "0.0.0"
+
 long_description = (this_directory / "README.md").read_text()
 # Read requirements from the file
 with open("requirements.txt") as f:
@@ -36,15 +50,17 @@ if "--cpu" in sys.argv:
     sys.argv.remove("--cpu")
 
 setup(
-    name="protenix",
+    name="steerable-v1",
     python_requires=">=3.11",
-    version="1.0.5",
-    description="A trainable PyTorch reproduction of AlphaFold 3.",
+    version=version,
+    description=(
+        "SteerABLE-v1: epitope-steered antibody-antigen structure prediction, "
+        "built on Protenix-v1."
+    ),
     long_description=long_description,
     long_description_content_type="text/markdown",
-    author="Bytedance Inc.",
-    url="https://github.com/bytedance/Protenix",
-    author_email="ai4s-bio@bytedance.com",
+    author="SteerABLE authors",
+    url="https://github.com/bhyun-ans/SteerABLEv1",
     packages=find_packages(
         exclude=(
             "assets",
@@ -61,7 +77,11 @@ setup(
     platforms="manylinux1",
     entry_points={
         "console_scripts": [
-            "protenix = runner.batch_inference:protenix_cli",
+            # Only `steerable-v1` is installed. Upstream Protenix installs a
+            # `protenix` command and SteerABLE (the Protenix-v2 sibling) a
+            # `steerable` command from the same module path; shipping either
+            # name here would collide in an environment that has both.
+            "steerable-v1 = runner.batch_inference:protenix_cli",
         ],
     },
 )

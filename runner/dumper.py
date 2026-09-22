@@ -25,6 +25,15 @@ from protenix.utils.file_io import save_json
 from protenix.utils.torch_utils import round_values
 
 
+def _to_numpy(value) -> np.ndarray:
+    """Detach a tensor to numpy for .npz storage (bf16/fp16 -> fp32)."""
+    if isinstance(value, torch.Tensor):
+        if value.dtype in (torch.bfloat16, torch.float16):
+            value = value.float()
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
 def get_clean_full_confidence(full_confidence_dict: dict) -> dict:
     """
     Clean and format the full confidence dictionary by removing
@@ -73,6 +82,9 @@ class DataDumper:
         pred_dict: dict,
         atom_array: AtomArray,
         entity_poly_type: dict[str, str],
+        gating: Optional[dict] = None,
+        gating_arrays: Optional[dict] = None,
+        branch: Optional[str] = None,
     ):
         """
         Dump the predictions and related data to the specified directory.
@@ -84,6 +96,12 @@ class DataDumper:
             pred_dict (dict): The dictionary containing the predictions.
             atom_array (AtomArray): The AtomArray object containing the structure data.
             entity_poly_type (dict[str, str]): The entity poly type information.
+            gating (Optional[dict]): Routing-gate report (enrichment, per-branch
+                timings) to save next to the predictions.
+            gating_arrays (Optional[dict]): Tensors behind the gate (contact map,
+                per-token contact score, token masks) to save as a .npz.
+            branch (Optional[str]): Name of the sampling branch these
+                predictions came from, recorded in the gating report.
         """
         dump_dir = self._get_dump_dir(dataset_name, pdb_id, seed)
         Path(dump_dir).mkdir(parents=True, exist_ok=True)
@@ -95,6 +113,41 @@ class DataDumper:
             atom_array=atom_array,
             entity_poly_type=entity_poly_type,
             seed=seed,
+        )
+        if gating is not None or gating_arrays is not None:
+            self._save_gating(
+                prediction_save_dir=os.path.join(dump_dir, "predictions"),
+                sample_name=pdb_id,
+                seed=seed,
+                gating=gating,
+                gating_arrays=gating_arrays,
+                branch=branch,
+            )
+
+    def dump_gating(
+        self,
+        dataset_name: str,
+        pdb_id: str,
+        seed: int,
+        gating: Optional[dict],
+        gating_arrays: Optional[dict],
+        branch: Optional[str] = None,
+    ) -> None:
+        """Write only the gate side-cars (no structures) into a run directory.
+
+        Used when several epitope sets share one trunk: every sampling branch
+        then lives in its own sub-directory and the trunk-level report +
+        contact map are written once, here, into the target's root directory
+        (which holds no structures of its own).
+        """
+        dump_dir = self._get_dump_dir(dataset_name, pdb_id, seed)
+        self._save_gating(
+            prediction_save_dir=os.path.join(dump_dir, "predictions"),
+            sample_name=pdb_id,
+            seed=seed,
+            gating=gating,
+            gating_arrays=gating_arrays,
+            branch=branch,
         )
 
     def _get_dump_dir(self, dataset_name: str, sample_name: str, seed: int) -> str:
@@ -156,18 +209,6 @@ class DataDumper:
             sorted_indices=sorted_indices,
             b_factor=b_factor,
         )
-        # Dump trajectory
-        if "trajectory" in pred_dict and pred_dict["trajectory"]:
-            self._save_trajectory(
-                trajectory=pred_dict["trajectory"],
-                trajectory_rotations=pred_dict.get("trajectory_rotations"),
-                dump_dir=dump_dir,
-                sample_name=pdb_id,
-                atom_array=atom_array,
-                sorted_indices=sorted_indices,
-                epitope_residue=pred_dict.get("epitope_residue"),
-            )
-
         # Dump confidence
         self._save_confidence(
             data=pred_dict,
@@ -222,119 +263,46 @@ class DataDumper:
                 pdb_id=sample_name,
             )
 
-    def _save_trajectory(
+    def _save_gating(
         self,
-        trajectory: list,
-        dump_dir: str,
+        prediction_save_dir: str,
         sample_name: str,
-        atom_array: AtomArray,
-        trajectory_rotations: Optional[list] = None,
-        sorted_indices: Optional[List[int]] = None,
-        epitope_residue: Optional[str] = None,
+        seed: int,
+        gating: Optional[dict],
+        gating_arrays: Optional[dict],
+        branch: Optional[str],
     ):
-        """Save diffusion trajectory as a multi-MODEL PDB per sample.
-
-        Each diffusion step becomes one MODEL block. The per-step cumulative
-        rotation applied by ``centre_random_augmentation`` is undone via
-        ``R_cum^T`` so all MODELs live in a common canonical frame
-        (removes the global spin seen in prior GIF renders).
-
-        When ``epitope_residue`` is given (format ``"C:13,C:18,D:56"``), the
-        atoms of those residues get b_factor=1.0 (non-epitope=0.0) and a
-        companion ``sample_<rank>_view.pml`` script is written that loads the
-        PDB and colors the epitope red so the viewer shows it in a distinct
-        color out of the box.
         """
-        from biotite.structure import AtomArrayStack
-        from biotite.structure.io.pdb import PDBFile
+        Save the routing-gate side-car files next to the predictions.
 
-        traj_dir = os.path.join(dump_dir, "traj")
-        os.makedirs(traj_dir, exist_ok=True)
+        Writes `<sample>_gating.json` (epitope contact enrichment, the branch
+        this directory holds, and the per-branch wall-clock) and, when the
+        arrays are given, `<sample>_contact_probs.npz` with the
+        [N_token, N_token] trunk contact map, the per-token contact score
+        e_j = max over antibody tokens, and the Ab / epitope token masks.
 
-        n_frames = len(trajectory)
-        N_sample = trajectory[0].shape[-3]
-        N_atom = atom_array.array_length()
-        if sorted_indices is None:
-            sorted_indices = list(range(N_sample))
-
-        # Build an epitope atom mask from the atom_array annotations. Shape [N_atom], bool.
-        epitope_mask = None
-        epitope_sel_pml = None
-        if epitope_residue:
-            chain_to_resi: dict[str, set[int]] = {}
-            for entry in epitope_residue.split(","):
-                entry = entry.strip()
-                if ":" not in entry:
-                    continue
-                ch, resi = entry.split(":", 1)
-                try:
-                    chain_to_resi.setdefault(ch.strip(), set()).add(int(resi.strip()))
-                except ValueError:
-                    continue
-            if chain_to_resi:
-                chains = atom_array.chain_id
-                resids = atom_array.res_id
-                epitope_mask = np.zeros(N_atom, dtype=bool)
-                for ch, resi_set in chain_to_resi.items():
-                    ch_match = chains == ch
-                    for r in resi_set:
-                        epitope_mask |= ch_match & (resids == r)
-                epitope_sel_pml = " or ".join(
-                    f"(chain {ch} and resi {'+'.join(str(r) for r in sorted(rs))})"
-                    for ch, rs in chain_to_resi.items()
-                )
-
-        for idx, rank in enumerate(sorted_indices):
-            coords = np.stack(
-                [trajectory[f][..., idx, :, :].numpy().astype(np.float32)
-                 for f in range(n_frames)],
-                axis=0,
-            )  # [n_frames, N_atom, 3]
-            if trajectory_rotations is not None:
-                rots = np.stack(
-                    [trajectory_rotations[f][..., idx, :, :].numpy().astype(np.float32)
-                     for f in range(n_frames)],
-                    axis=0,
-                )  # [n_frames, 3, 3]
-                # x_world = R_cum @ x_canonical → x_canonical = R_cum^T @ x_world.
-                # For row-vectors [N_atom, 3], that's coords @ R_cum.
-                coords = np.einsum('fai,fij->faj', coords, rots)
-
-            coords = coords - coords.mean(axis=1, keepdims=True)
-            np.clip(coords, -999.0, 9999.0, out=coords)
-
-            stack = AtomArrayStack(depth=n_frames, length=N_atom)
-            for cat in atom_array.get_annotation_categories():
-                stack.set_annotation(cat, atom_array.get_annotation(cat))
-            if atom_array.bonds is not None:
-                stack.bonds = atom_array.bonds
-            stack.coord = coords
-            if epitope_mask is not None:
-                b_marker = np.where(epitope_mask, 1.0, 0.0).astype(np.float32)
-                stack.set_annotation("b_factor", b_marker)
-
-            out_path = os.path.join(traj_dir, f"sample_{rank}.pdb")
-            pdb = PDBFile()
-            pdb.set_structure(stack)
-            pdb.write(out_path)
-
-            if epitope_sel_pml is not None:
-                pml_path = os.path.join(traj_dir, f"sample_{rank}_view.pml")
-                with open(pml_path, "w") as f:
-                    f.write(
-                        f"load {os.path.basename(out_path)}, traj\n"
-                        "hide everything\n"
-                        "show cartoon\n"
-                        "util.cbc\n"
-                        f"select epitope,{epitope_sel_pml}\n"
-                        "color red, epitope\n"
-                        "show sticks, epitope\n"
-                        "set stick_radius, 0.25, epitope\n"
-                        "show spheres, epitope and name CA\n"
-                        "set sphere_scale, 1.2, epitope and name CA\n"
-                        "orient\n"
-                        "mplay\n"
-                    )
+        Args:
+            prediction_save_dir (str): Directory the predictions were saved to.
+            sample_name (str): Sample name.
+            seed (int): Prediction seed.
+            gating (Optional[dict]): JSON-serialisable gate report.
+            gating_arrays (Optional[dict]): Tensors to store in the .npz.
+            branch (Optional[str]): Sampling branch of this directory.
+        """
+        os.makedirs(prediction_save_dir, exist_ok=True)
+        if gating is not None:
+            report = {"sample_name": sample_name, "seed": seed, "branch": branch}
+            report.update(gating)
+            save_json(
+                report,
+                os.path.join(prediction_save_dir, f"{sample_name}_gating.json"),
+                indent=4,
+            )
+        if gating_arrays:
+            np.savez_compressed(
+                os.path.join(prediction_save_dir, f"{sample_name}_contact_probs.npz"),
+                **{k: _to_numpy(v) for k, v in gating_arrays.items()},
+            )
 
     def _get_ranker_indices(self, data: dict) -> List[int]:
         """
@@ -387,16 +355,12 @@ class DataDumper:
                 )
         if sorted_indices is None:
             sorted_indices = range(N_sample)
-        reward_history_all = data.get("reward_history")
         for idx, rank in enumerate(sorted_indices):
             output_fpath = os.path.join(
                 prediction_save_dir,
                 f"{sample_name}_summary_confidence_sample_{rank}.json",
             )
-            summary = dict(data["summary_confidence"][idx])  # shallow copy to avoid mutating source
-            if reward_history_all is not None and idx < len(reward_history_all):
-                summary["reward_history"] = reward_history_all[idx]
-            save_json(summary, output_fpath, indent=4)
+            save_json(data["summary_confidence"][idx], output_fpath, indent=4)
             if self.need_atom_confidence:
                 output_fpath = os.path.join(
                     prediction_save_dir,

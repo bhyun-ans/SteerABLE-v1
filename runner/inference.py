@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import json
 import logging
 import os
@@ -200,14 +201,18 @@ class InferenceRunner(object):
         )
 
     # Adapted from runner.train.AF3Trainer.evaluate
+    #
+    # NOTE: no @torch.no_grad() here. When epitope-guided sampling is active,
+    # autograd must flow through the denoiser so the reward can backprop to the
+    # trunk embeddings. sample_diffusion enters torch.enable_grad() locally on
+    # its guided branch; the baseline path wraps itself in
+    # torch.no_grad() below to preserve prior memory behaviour.
+    # The grad/amp state relaxed here is re-tightened per sampling branch inside
+    # _main_inference_loop, so the unguided branch of a gated run still samples
+    # under no_grad + autocast like a run with no guidance configured.
     def predict(self, data: Mapping[str, Mapping[str, Any]]) -> dict[str, torch.Tensor]:
         """
         Run model prediction on the provided data.
-
-        When epitope guidance is enabled, gradient computation is needed inside
-        the diffusion loop, so torch.no_grad() is not used globally.
-        The guided path enables grad only for the specific reward computation;
-        the rest of the forward pass still benefits from no_grad.
 
         Args:
             data (Mapping[str, Mapping[str, Any]]): Input data dictionary.
@@ -221,17 +226,23 @@ class InferenceRunner(object):
             "fp16": torch.float16,
         }[self.configs.dtype]
 
-        enable_amp = (
-            torch.autocast(device_type="cuda", dtype=eval_precision)
-            if torch.cuda.is_available()
-            else nullcontext()
-        )
+        epitope_on = bool(getattr(self.configs, "epitope_residue", None))
 
-        # When guidance is on, we cannot use global no_grad because
-        # torch.enable_grad() inside the sampling loop needs to work.
-        # When guidance is off, use no_grad for memory efficiency.
-        guidance_on = getattr(self.configs, "epitope_residue", None) is not None
-        grad_ctx = nullcontext() if guidance_on else torch.no_grad()
+        # amp follows `dtype` whether or not guidance is configured, so
+        # `--dtype bf16` really is bf16 for the trunk and the confidence head.
+        # What the reward backward cannot tolerate is bf16 inside the denoiser,
+        # and that is already handled where it belongs: sample_diffusion runs
+        # under autocasting_disable_decorator(skip_amp.sample_diffusion), which
+        # casts its inputs to fp32 and disables autocast for the sampler.
+        # (update_inference_configs only clears that flag above 3840 tokens.)
+        # Suppressing amp for the whole forward instead silently ignored the
+        # requested dtype and cost the trunk its bf16 speed and memory.
+        if torch.cuda.is_available():
+            enable_amp = torch.autocast(device_type="cuda", dtype=eval_precision)
+        else:
+            enable_amp = nullcontext()
+
+        grad_ctx = nullcontext() if epitope_on else torch.no_grad()
 
         data = to_device(data, self.device)
         with grad_ctx, enable_amp:
@@ -392,6 +403,99 @@ def download_inference_cache(configs: Any) -> None:
             download_from_url(tos_url, esm_3b_ism_ckpt_path2)
 
 
+def _restore_activation_checkpointing(runner) -> bool:
+    """Turn activation checkpointing back on across the model, in place.
+
+    `blocks_per_ckpt` is read from each module's own attribute, set at
+    construction (DiffusionModule, DiffusionTransformer and the atom
+    encoder/decoder each keep their own), so changing the config object after
+    the model is built has no effect. Walk the modules instead.
+
+    Returns False when nothing was off, so the caller knows this lever is spent.
+    """
+    changed = False
+    for module in runner.model.modules():
+        if getattr(module, "blocks_per_ckpt", "missing") is None:
+            module.blocks_per_ckpt = 1
+            changed = True
+    return changed
+
+
+def _predict_with_oom_backoff(runner, configs, data, sample_name: str):
+    """Run one target, halving the diffusion sample chunk on CUDA OOM.
+
+    Per-sample epitope steering gives every sample in a chunk its own steered
+    pair embedding, so the dominant O(N_token^2 * c_z) tensors scale with the
+    chunk size instead of being shared.  That is what makes the batch dimension
+    usable at all (see protenix/model/generator.py), but it also means the chunk
+    that fits is a function of target size: measured on a 48 GB A6000, chunk 5
+    fits at 349 tokens and needs ~50 GB at 729.
+
+    Rather than hard-code a size table and lose targets when it is wrong, start
+    at the requested chunk and back off until it fits.  Sampling is unaffected:
+    each sample keeps its own steering trajectory whatever the chunk, so the
+    only difference between chunk settings is how many run concurrently.
+
+    Without this a large target OOMs, gets swallowed by the caller's bare
+    `except Exception`, and silently drops out of the benchmark.
+    """
+    chunk = configs.infer_setting.sample_diffusion_chunk_size
+    n_sample = configs.sample_diffusion["N_sample"]
+    if chunk is None:
+        chunk = n_sample
+    ckpt_restored = False
+    while True:
+        try:
+            # predict() CONSUMES the feature dict -- protenix.py notes "the
+            # input_feature_dict is modified when mode is 'inference'" and
+            # deep-copies it for the multi-seed path for exactly this reason.
+            # A retry on the original therefore dies with a KeyError on a
+            # feature the first attempt already popped, masking the OOM.
+            # Hand every attempt that might be retried its own copy.
+            retryable = chunk > 1 or not ckpt_restored
+            return runner.predict(copy.deepcopy(data) if retryable else data)
+        except torch.OutOfMemoryError:
+            # Guarded: init_env falls back to CPU when no device is visible, and
+            # the CUDA memory APIs raise rather than no-op there.
+            cuda = torch.cuda.is_available()
+            if cuda:
+                torch.cuda.empty_cache()
+            if chunk <= 1:
+                # Last resort: put activation checkpointing back. Turning it off
+                # is a speed win that costs memory, so a target that fit under
+                # the stock (checkpointed) settings can OOM without it. Trading
+                # the speed back is better than losing the target.
+                if not ckpt_restored and _restore_activation_checkpointing(runner):
+                    ckpt_restored = True
+                    logger.warning(
+                        f"{sample_name}: OOM at chunk_size=1 -- re-enabling "
+                        "activation checkpointing and retrying. This is slower "
+                        "but does not change results."
+                    )
+                    continue
+                logger.error(
+                    f"{sample_name}: OOM at sample_diffusion_chunk_size=1 with "
+                    "activation checkpointing on; nothing left to back off to."
+                )
+                raise
+            chunk = max(1, chunk // 2)
+            logger.warning(
+                f"{sample_name}: CUDA OOM -- retrying with "
+                f"sample_diffusion_chunk_size={chunk} "
+                + (
+                    f"(peak was {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB). "
+                    if cuda
+                    else ""
+                )
+                + "Results are unaffected; only the number of samples run "
+                "concurrently changes."
+            )
+            configs.infer_setting.sample_diffusion_chunk_size = chunk
+            runner.update_model_configs(configs)
+            if cuda:
+                torch.cuda.reset_peak_memory_stats()
+
+
 def update_inference_configs(configs: Any, n_token: int) -> Any:
     """
     Adjust inference configurations based on the number of tokens to avoid OOM.
@@ -403,6 +507,58 @@ def update_inference_configs(configs: Any, n_token: int) -> Any:
     Returns:
         Any: Updated configurations.
     """
+    # Cap the diffusion sample chunk by target size when epitope steering is on.
+    #
+    # With per-sample steering each sample in a chunk carries its own steered
+    # pair embedding, so the O(N_token^2 * c_z) tensors scale with the chunk
+    # instead of being shared. Measured on a 48 GB A6000 (fp32, N_sample=5,
+    # gating.mode=both): chunk 5 fits at 349 tokens, and at 729 tokens it asks
+    # for ~50 GB and dies. Starting a large target at chunk 5 therefore burns a
+    # full failed attempt -- ~10 minutes for a 729-token target -- before the
+    # backoff in _predict_with_oom_backoff can rescue it.
+    #
+    # The ceilings below are a cheap first guess, not a guarantee; the backoff
+    # is what actually keeps a target from being lost. Only lower the requested
+    # chunk, never raise it, so an explicit CLI value stays an upper bound.
+    if getattr(configs, "epitope_residue", None):
+        # Remember what the caller actually asked for. This function mutates the
+        # shared configs object once per target, and the OOM backoff lowers it
+        # again, so without a pristine copy one large target would permanently
+        # pin every later target in the same process to chunk 1.
+        if not hasattr(configs, "_requested_diffusion_chunk_size"):
+            configs._requested_diffusion_chunk_size = (
+                configs.infer_setting.sample_diffusion_chunk_size
+            )
+        requested = configs._requested_diffusion_chunk_size
+        if requested is None:
+            requested = configs.sample_diffusion["N_sample"]
+        # NOTE (SteerABLE-v1): these ceilings were calibrated on Protenix-v2
+        # (c_z=256). Protenix-v1's pair embedding is half as wide (c_z=128), so
+        # they are conservative here; the backoff below is still the safety net.
+        # Calibrated on a 48 GB A6000, fp32, N_sample=5, gating.mode=both:
+        #   349 fits at chunk 5,  395 does not
+        #   490 fits at chunk 3
+        #   655 does not fit at chunk 2
+        # The backoff is still the safety net; these only avoid burning a full
+        # featurization + trunk re-run to rediscover a known limit.
+        if n_token <= 350:
+            ceiling = 5
+        elif n_token <= 500:
+            ceiling = 3
+        elif n_token <= 600:
+            ceiling = 2
+        else:
+            ceiling = 1
+        chunk = min(requested, ceiling)
+        if chunk != configs.infer_setting.sample_diffusion_chunk_size:
+            logger.info(
+                f"N_token={n_token}: sample_diffusion_chunk_size "
+                f"{configs.infer_setting.sample_diffusion_chunk_size} -> {chunk} "
+                f"(requested {requested}, size ceiling {ceiling}); per-sample "
+                "steering scales the pair embedding with the chunk."
+            )
+        configs.infer_setting.sample_diffusion_chunk_size = chunk
+
     # Adjust configurations based on sequence length to manage memory usage
     if n_token > 3840:
         configs.skip_amp.confidence_head = False
@@ -415,6 +571,19 @@ def update_inference_configs(configs: Any, n_token: int) -> Any:
         configs.skip_amp.sample_diffusion = True
 
     return configs
+
+
+def _format_enrichment(gating: dict) -> str:
+    """One enrichment for a single epitope set, one per branch for several."""
+
+    def _fmt(value):
+        return "n/a" if value is None else f"{value:.3f}"
+
+    if "epitopes" in gating:
+        return "[" + ", ".join(
+            f"{e.get('branch')}={_fmt(e.get('enrichment'))}" for e in gating["epitopes"]
+        ) + "]"
+    return _fmt(gating.get("enrichment"))
 
 
 def infer_predict(runner: InferenceRunner, configs: Any) -> None:
@@ -485,20 +654,94 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                 )
                 new_configs = update_inference_configs(configs, data["N_token"].item())
                 runner.update_model_configs(new_configs)
-                prediction = runner.predict(data)
-                runner.dumper.dump(
-                    dataset_name="",
-                    pdb_id=sample_name,
-                    seed=seed,
-                    pred_dict=prediction,
-                    atom_array=atom_array,
-                    entity_poly_type={
-                        k: v
-                        for k, v in data["entity_poly_type"].items()
-                        if v != "non-polymer"
-                    },
+                # --blocks_per_ckpt null keeps activations instead of
+                # recomputing them, which buys 1.4-2.3x but costs memory:
+                # measured on a 48 GB A6000 it fits at 729 tokens and does not
+                # at 936. Restore it up front for large targets -- the backoff
+                # would get there anyway, but only after wasting a full
+                # featurization and trunk pass.
+                #
+                # --auto_restore_activation_checkpointing false disables this
+                # safety net. The published runs had no such restore, so
+                # reproducing them exactly needs the flag off (and then a large
+                # target may OOM instead of completing more slowly).
+                if (
+                    getattr(configs, "auto_restore_activation_checkpointing", True)
+                    and data["N_token"].item() > 800
+                    and _restore_activation_checkpointing(runner)
+                ):
+                    logger.info(
+                        f"N_token={data['N_token'].item()}: restoring activation "
+                        "checkpointing up front; --blocks_per_ckpt null does not "
+                        "fit at this size. Pass "
+                        "--auto_restore_activation_checkpointing false to keep it off."
+                    )
+                prediction = _predict_with_oom_backoff(
+                    runner, new_configs, data, sample_name
                 )
+                entity_poly_type = {
+                    k: v
+                    for k, v in data["entity_poly_type"].items()
+                    if v != "non-polymer"
+                }
+                gating = prediction.pop("gating", None)
+                gating_arrays = prediction.pop("gating_arrays", None)
+                # With gating.mode="both" the model samples one branch per
+                # entry, primary first; the primary keeps the normal output
+                # layout and each extra branch gets its own sub-directory.
+                branches = prediction.pop("branches", None) or [(None, prediction)]
+                # Several epitope sets: no branch is "the" steered result, so
+                # every branch (steerable_<k> per set, raw) gets its own
+                # sub-directory and the target's root directory holds only the
+                # trunk-level side-cars (gate report + contact map), written
+                # once below. A single-branch run (gating.mode=raw) keeps the
+                # normal layout whatever the number of sets.
+                multi_epitope = (gating or {}).get("n_epitope_sets", 1) > 1 and len(
+                    branches
+                ) > 1
+                for branch_idx, (branch_name, branch_pred) in enumerate(branches):
+                    is_primary = branch_idx == 0 and not multi_epitope
+                    runner.dumper.dump(
+                        dataset_name="" if is_primary else branch_name,
+                        pdb_id=sample_name,
+                        seed=seed,
+                        pred_dict=branch_pred,
+                        atom_array=atom_array,
+                        entity_poly_type=entity_poly_type,
+                        gating=gating,
+                        # the contact map is trunk-level: identical for every
+                        # branch, so store it once
+                        gating_arrays=gating_arrays if is_primary else None,
+                        branch=branch_name or (gating or {}).get("branches_run", [None])[0],
+                    )
+                if multi_epitope:
+                    runner.dumper.dump_gating(
+                        dataset_name="",
+                        pdb_id=sample_name,
+                        seed=seed,
+                        gating=gating,
+                        gating_arrays=gating_arrays,
+                        branch=None,
+                    )
                 t2_end = time.time()
+                if gating is not None:
+                    gate_time = gating.get("time", {})
+                    logger.info(
+                        "[gating] %s [seed:%d] enrichment=%s mode=%s threshold=%s "
+                        "branches=%s routed=%s | trunk %.1fs, %s",
+                        sample_name,
+                        seed,
+                        _format_enrichment(gating),
+                        gating.get("mode"),
+                        gating.get("threshold"),
+                        gating.get("branches_run"),
+                        gating.get("routed_branch"),
+                        gate_time.get("pairformer", float("nan")),
+                        ", ".join(
+                            f"{name} {gate_time.get(name, {}).get('total', float('nan')):.1f}s"
+                            for name in gating.get("branches_run", [])
+                        ),
+                    )
                 logger.info(
                     f"[Rank {DIST_WRAPPER.rank}] {sample_name} [seed:{seed}] succeeded. "
                     f"Model forward time: {t2_end - t2_start:.2f}s. "
@@ -652,6 +895,39 @@ def run() -> None:
     logger.info(
         f"Optimization: shared_vars_cache={configs.enable_diffusion_shared_vars_cache}, "
         f"efficient_fusion={configs.enable_efficient_fusion}, tf32={configs.enable_tf32}"
+    )
+    # Upstream ships 0.4. When the coin lands, F.dropout runs on the pair
+    # embedding at every recycling pass -- and because it consumes torch RNG it
+    # also shifts every MSA subset the trunk samples afterwards. Measured on
+    # 8dtn: coin True gives enrichment 3.4052, coin False gives 1.8928. Say the
+    # effective rate out loud so a run's trunk regime is never a mystery.
+    # "checkpointing" here is the autograd sense (sparse activation waypoints,
+    # recompute the span after each one), not saved weights. blocks_per_ckpt is
+    # the span length: 1 = the most checkpointing, None = none at all
+    # (`--blocks_per_ckpt null`). It only bites where grad is on -- diffusion.py
+    # disables it whenever torch.is_grad_enabled() is False -- so at inference
+    # only the epitope-steered branch pays it; the unguided branch never does.
+    _bpc = configs.blocks_per_ckpt
+    logger.info(
+        f"Activation checkpointing: blocks_per_ckpt={_bpc} -- "
+        + (
+            "OFF, block activations are KEPT for backward (no recompute: faster, "
+            "but the steered branch holds much more memory and may OOM on large "
+            "targets or large sample chunks; the OOM backoff restores it)"
+            if _bpc is None
+            else f"ON every {_bpc} block(s), activations are DISCARDED and "
+            "recomputed during backward (one extra forward: slower, much less "
+            "memory). Only the epitope-steered branch pays this."
+        )
+    )
+    logger.info(
+        f"MC dropout: apply_rate={configs.mc_dropout_apply_rate} "
+        f"(rate={configs.mc_dropout_rate}) -- "
+        + (
+            "OFF for every forward"
+            if configs.mc_dropout_apply_rate == 0
+            else "ACTIVE: each forward flips a coin for a different trunk"
+        )
     )
     download_inference_cache(configs)
     main(configs)

@@ -17,8 +17,8 @@ Reward-guided embedding steering for diffusion sampling (Ab–Ag specialised).
 
 Core idea: during reverse diffusion, steer trunk embeddings (s, z) via the
 gradient of a contact-based reward that encourages epitope (antigen)
-residues to make contacts with antibody atoms.  Unlike the generic
-hotspot-on-any-chain mode, the partner-atom mask is restricted to the
+residues to make contacts with antibody atoms.  Unlike a generic
+contact-on-any-chain mode, the partner-atom mask is restricted to the
 antibody chains supplied via ``ab_chain_ids``, so antigen-antigen
 inter-chain contacts are excluded — necessary for homo-multimeric antigens.
 """
@@ -122,13 +122,48 @@ def validate_and_infer_ag_chains(
     return ag_chain_ids
 
 
+# Separator between independent epitope SETS inside one `epitope_residue`
+# string. Residues inside a set stay comma-separated, so
+#     "B:14,B:15;B:47,B:48"
+# is two sets. Each set is steered by its own diffusion branch off the one
+# shared trunk (see `_main_inference_loop` in protenix/model/protenix.py).
+EPITOPE_SET_SEPARATOR = ";"
+
+
+def parse_epitope_sets(epitope_str: str) -> list[str]:
+    """Split an `epitope_residue` string into its epitope sets.
+
+    One set (no separator) comes back as a one-element list, so callers can
+    treat the single-epitope case and the multi-epitope case uniformly.
+    Whitespace around a set and empty sets (a trailing ``;``) are dropped.
+
+    Args:
+        epitope_str: ``"C:45,C:48"`` or ``"C:45,C:48;D:52,D:53"``.
+
+    Returns:
+        The per-set strings, in the order given, each parseable by
+        :func:`parse_epitope_residue`.
+
+    Raises:
+        ValueError: If no non-empty set remains.
+    """
+    sets = [s.strip() for s in epitope_str.split(EPITOPE_SET_SEPARATOR)]
+    sets = [s for s in sets if s]
+    if not sets:
+        raise ValueError(f"No epitope set found in '{epitope_str}'.")
+    return sets
+
+
 def parse_epitope_residue(epitope_str: str) -> list[tuple[int, int]]:
-    """Parse epitope residue string into (chain_asym_id, residue_number) pairs.
+    """Parse ONE epitope set into (chain_asym_id, residue_number) pairs.
 
     Format: ``"C:45,C:48,D:52"``.  Chain letter maps to 0-based asym_id:
     A=0, B=1, C=2, …  Each epitope residue lives on an antigen chain
     (see :func:`parse_chain_list` and :func:`build_guidance_masks` for
     Ab/Ag separation semantics).
+
+    A multi-set string (containing :data:`EPITOPE_SET_SEPARATOR`) is
+    rejected here -- split it with :func:`parse_epitope_sets` first.
 
     Args:
         epitope_str: Comma-separated ``"CHAIN:RESIDUE"`` entries.
@@ -139,6 +174,12 @@ def parse_epitope_residue(epitope_str: str) -> list[tuple[int, int]]:
     Raises:
         ValueError: On malformed input.
     """
+    if EPITOPE_SET_SEPARATOR in epitope_str:
+        raise ValueError(
+            f"'{epitope_str}' holds several epitope sets (separator "
+            f"'{EPITOPE_SET_SEPARATOR}'); split it with parse_epitope_sets() "
+            "and parse one set at a time."
+        )
     epitopes: list[tuple[int, int]] = []
     for entry in epitope_str.split(","):
         entry = entry.strip()
@@ -298,24 +339,27 @@ def _single_chain_reward(
     d0: float,
     softmin_beta: float,
     eps: float,
-    top_k: Optional[int] = None,
+    top_k: int = 1,
+    per_sample: bool = False,
 ) -> torch.Tensor:
     """Reward for one Ag chain group, aggregating per residue.  Internal helper.
 
     For each epitope residue:
       1. Compute softmin distance to partner atoms for each atom in the residue.
       2. Select the ``top_k`` atoms with the smallest softmin distance.
-         If ``top_k`` is ``None`` or larger than the residue's atom count,
-         use all atoms.
+         If ``top_k`` is larger than the residue's atom count, use all atoms.
       3. Penalty contribution = ``Σ softplus(softmin_d - d0)²`` over selected atoms.
 
     Args:
         top_k: How many atoms per residue to include in the penalty.
-            ``None`` = use all atoms (original behaviour).
-            Falls back to "all" if a residue has fewer atoms than ``top_k``.
+            Callers pass ``generator.CONTACT_TOP_K`` (= 1, the single closest
+            atom), which is not user-configurable. Falls back to "all" if a
+            residue has fewer atoms than ``top_k``.
     """
     if not residue_groups or not partner_mask.any():
-        return torch.tensor(0.0, device=coords_flat.device, dtype=coords_flat.dtype)
+        B = coords_flat.shape[0]
+        zero = torch.zeros(B, device=coords_flat.device, dtype=coords_flat.dtype)
+        return zero if per_sample else zero.mean()
 
     p_coords = coords_flat[:, partner_mask]  # [B, N_p, 3]
     B = coords_flat.shape[0]
@@ -340,8 +384,8 @@ def _single_chain_reward(
         )
 
         # Select top-k atoms with smallest softmin distance.
-        # Fall back to "use all" when k is None or exceeds n_atoms.
-        if top_k is not None and top_k < n_atoms:
+        # Fall back to "use all" when k exceeds n_atoms.
+        if top_k < n_atoms:
             selected, _ = torch.topk(softmin_d, k=top_k, dim=-1, largest=False)  # [B, k]
         else:
             selected = softmin_d  # [B, n_atoms]
@@ -349,7 +393,11 @@ def _single_chain_reward(
         penalty = F.softplus(selected - d0)
         total_penalty = total_penalty + (penalty ** 2).sum(dim=-1)  # [B]
 
-    return -total_penalty.mean()
+    # per_sample keeps the leading axis (one reward per diffusion sample) so that
+    # a batched chunk can steer each sample by its OWN gradient. Collapsing it
+    # here is what made sample_diffusion_chunk_size>1 average the reward across
+    # the chunk and cancel opposing gradients.
+    return -total_penalty if per_sample else -total_penalty.mean()
 
 
 def contact_epitope_reward(
@@ -358,7 +406,8 @@ def contact_epitope_reward(
     d0: float = 4.0,
     softmin_beta: float = 10.0,
     eps: float = 1e-8,
-    top_k: Optional[int] = None,
+    top_k: int = 1,
+    per_sample: bool = False,
 ) -> torch.Tensor:
     """Differentiable contact reward for epitope ↔ antibody atoms.
 
@@ -371,7 +420,7 @@ def contact_epitope_reward(
         For each atom a in the epitope residue:
             softmin_d(a) = -1/β · logsumexp(-β · ‖x_a - x_p‖,  p ∈ Ab atoms)
         Select the ``top_k`` atoms with smallest softmin_d (or all if
-        the residue has fewer atoms).
+        the residue has fewer atoms; ``top_k`` is fixed at 1 by the caller).
         R_residue = - Σ_{a ∈ topk} softplus(softmin_d(a) - d0)²
 
     Total reward = Σ over epitope residues across all Ag chain groups.
@@ -386,23 +435,37 @@ def contact_epitope_reward(
         softmin_beta: Inverse temperature for soft-minimum.
         eps: Numerical stability constant.
         top_k: How many atoms per epitope residue to include in the
-            penalty (selected by smallest softmin distance).
-            ``None`` = use all atoms in each residue.
-            Falls back to "all" if a residue has fewer atoms than ``top_k``.
+            penalty (selected by smallest softmin distance). The sampler always
+            passes ``generator.CONTACT_TOP_K`` (= 1); it is not exposed as a
+            config knob. Falls back to "all" if a residue has fewer atoms
+            than ``top_k``.
+
+        per_sample: Return one reward per leading (sample) element instead of a
+            scalar.  Required for batched per-sample steering — see
+            :func:`rms_normalize` and ``sample_diffusion`` in
+            ``protenix/model/generator.py``.
 
     Returns:
-        Scalar reward (higher = better contact).
+        Scalar reward (higher = better contact), or ``[B]`` when ``per_sample``.
     """
-    if not mask_pairs:
-        return torch.tensor(0.0, device=coords.device, dtype=coords.dtype)
-
     orig_shape = coords.shape
+    B = 1
+    for d in orig_shape[:-2]:
+        B *= d
+
+    if not mask_pairs:
+        zero = torch.zeros(B, device=coords.device, dtype=coords.dtype)
+        return zero if per_sample else zero.mean()
+
     coords_flat = coords.reshape(-1, orig_shape[-2], orig_shape[-1])  # [B, N_atom, 3]
 
-    total_reward = torch.tensor(0.0, device=coords.device, dtype=coords.dtype)
+    total_reward = torch.zeros(B, device=coords.device, dtype=coords.dtype)
+    if not per_sample:
+        total_reward = total_reward.mean()
     for residue_groups, partner_mask in mask_pairs:
         total_reward = total_reward + _single_chain_reward(
             coords_flat, residue_groups, partner_mask, d0, softmin_beta, eps, top_k,
+            per_sample=per_sample,
         )
     return total_reward
 
@@ -414,6 +477,7 @@ def _single_chain_clash_penalty(
     vdw_radii: torch.Tensor,
     tau: float,
     eps: float,
+    per_sample: bool = False,
 ) -> torch.Tensor:
     """Epitope-local inter-chain clash penalty for one Ag chain group (C2).
 
@@ -430,7 +494,9 @@ def _single_chain_clash_penalty(
     Returns a scalar ≥ 0.  Caller negates it to form a reward.
     """
     if not residue_groups or not partner_mask.any():
-        return torch.tensor(0.0, device=coords_flat.device, dtype=coords_flat.dtype)
+        B = coords_flat.shape[0]
+        zero = torch.zeros(B, device=coords_flat.device, dtype=coords_flat.dtype)
+        return zero if per_sample else zero.mean()
 
     p_coords = coords_flat[:, partner_mask]                          # [B, N_p, 3]
     p_radii = vdw_radii[partner_mask].to(coords_flat.dtype)          # [N_p]
@@ -453,7 +519,7 @@ def _single_chain_clash_penalty(
 
         total = total + penalty.sum(dim=(-2, -1))                     # [B]
 
-    return total.mean()
+    return total if per_sample else total.mean()
 
 
 def epitope_clash_reward(
@@ -462,6 +528,7 @@ def epitope_clash_reward(
     ref_element: torch.Tensor,
     tau: float = 1.5,
     eps: float = 1e-8,
+    per_sample: bool = False,
 ) -> torch.Tensor:
     """Differentiable epitope-local clash reward (C2).
 
@@ -478,37 +545,69 @@ def epitope_clash_reward(
         tau: Overlap tolerance in Ångströms (default 1.5, AF3-style).
         eps: Numerical stability for distance sqrt.
 
+        per_sample: Return one penalty per leading (sample) element instead of a
+            scalar.  See :func:`contact_epitope_reward`.
+
     Returns:
-        Scalar reward (≤ 0; higher = less clash).
+        Scalar reward (≤ 0; higher = less clash), or ``[B]`` when ``per_sample``.
     """
+    orig_shape = coords.shape
+    B = 1
+    for d in orig_shape[:-2]:
+        B *= d
+
     if not mask_pairs:
-        return torch.tensor(0.0, device=coords.device, dtype=coords.dtype)
+        zero = torch.zeros(B, device=coords.device, dtype=coords.dtype)
+        return zero if per_sample else zero.mean()
 
     from protenix.metrics.clash import get_vdw_radii
     vdw_radii = get_vdw_radii(ref_element).to(coords.device)          # [N_atom]
 
-    orig_shape = coords.shape
     coords_flat = coords.reshape(-1, orig_shape[-2], orig_shape[-1])  # [B, N_atom, 3]
 
-    total_penalty = torch.tensor(0.0, device=coords.device, dtype=coords.dtype)
+    total_penalty = torch.zeros(B, device=coords.device, dtype=coords.dtype)
+    if not per_sample:
+        total_penalty = total_penalty.mean()
     for residue_groups, partner_mask in mask_pairs:
         total_penalty = total_penalty + _single_chain_clash_penalty(
             coords_flat, residue_groups, partner_mask, vdw_radii, tau, eps,
+            per_sample=per_sample,
         )
     return -total_penalty
 
 
-def rms_normalize(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """RMS-normalise a tensor (global RMS across all elements).
+def rms_normalize(
+    x: torch.Tensor, eps: float = 1e-8, sample_dim: Optional[int] = None
+) -> torch.Tensor:
+    """RMS-normalise a tensor.
+
+    With ``sample_dim=None`` this is the original global RMS over every element.
+
+    With ``sample_dim`` set, the RMS is taken **per sample** — over every axis
+    except ``sample_dim``.  That is required whenever a chunk holds more than
+    one diffusion sample: a global RMS couples the samples through the
+    denominator, so a sample with a larger gradient would take a larger step
+    than it does in the serial (chunk_size=1) sampler.  Per-sample normalisation
+    makes the batched update identical to running the samples one at a time.
+
+    Note this is exactly equivalent to the global form when the sample axis has
+    length 1, so the chunk_size=1 path is unchanged.
 
     Args:
         x: Tensor of arbitrary shape.
-        eps: Stability constant.
+        eps: Stability constant (inside the sqrt, as in the original).
+        sample_dim: Axis holding the diffusion samples, or None for global RMS.
 
     Returns:
-        Tensor of the same shape with unit RMS.
+        Tensor of the same shape with unit RMS (per sample, if requested).
     """
-    rms = torch.sqrt(torch.mean(x * x) + eps)
+    if sample_dim is None:
+        rms = torch.sqrt(torch.mean(x * x) + eps)
+        return x / rms
+
+    dim = sample_dim % x.dim()
+    reduce_dims = [d for d in range(x.dim()) if d != dim]
+    rms = torch.sqrt(torch.mean(x * x, dim=reduce_dims, keepdim=True) + eps)
     return x / rms
 
 
