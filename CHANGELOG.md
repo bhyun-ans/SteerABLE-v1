@@ -54,6 +54,14 @@ Protenix-v2; the two share one interface and one steering algorithm.
   README's reproduction section.
 - The epitope options live under `--epitope.*` (was `--guidance.*` in EmAbAg).
 
+### Known behaviour
+- On Protenix-v1 the pairformer trunk computed with in-place ops disabled (as
+  every grad-enabled, i.e. epitope-configured, run does) differs from the plain
+  in-place trunk at bf16 rounding level; on Protenix-v2 the two are identical.
+  A gated run's `raw` branch therefore matches its steered sibling's trunk but
+  not a separate run without `--epitope_residue`. Grad mode and activation
+  checkpointing do not change the trunk. See the README.
+
 ### Removed
 - The training and fine-tuning stack, training-data preparation scripts and
   the upstream benchmark reports (inference-only release).

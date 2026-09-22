@@ -265,6 +265,19 @@ same trunk, with matched noise, and writes the unguided one to `./out/raw/`.
 That is the paired comparison you want when deciding whether steering helped on
 a given target. It costs about twice as much.
 
+**Use `both` rather than a separate unguided run, on Protenix-v1 especially.**
+With an epitope configured, autograd is enabled for the whole forward, and
+Protenix turns its in-place trunk operations off whenever grad is on. On
+Protenix-v1 the in-place and out-of-place trunk paths are not bit-identical
+(bf16 rounding in the chunked attention / triangle-update paths; measured on a
+176-token target as max |Δz| ≈ 40 and contact probabilities up to 0.3 apart,
+while on Protenix-v2 the two paths agree to the bit), and 200 diffusion steps
+turn that into different samples. So the `raw` branch of a gated run shares its
+trunk with the steered branch, as intended, but is *not* the same structure a
+run without `--epitope_residue` would produce. Grad mode itself and activation
+checkpointing (`--blocks_per_ckpt`) do not change the trunk; only the in-place
+flag does.
+
 ### Reading the gate report
 
 Every steered run writes `predictions/<name>_gating.json`. Besides the steering
@@ -326,7 +339,10 @@ python runner/inference.py \
 
 (`--epitope.lambda_clash 0.0` for the no-clash arm.) With one sample per chunk
 the per-sample machinery reduces exactly to EmAbAg's serial sampler, so this
-command reproduces those runs. `--epitope.guidance_interval 8`, the default,
+command reproduces those runs bit for bit (verified under `--deterministic true`).
+Note that the baseline arm of those benchmarks was a plain run, whose trunk
+differs from the steered arms' trunk by the in-place rounding described under
+[Comparing against no guidance](#comparing-against-no-guidance). `--epitope.guidance_interval 8`, the default,
 was calibrated on Protenix-v2 and is offered on v1 for interface parity; validate
 it on DockQ before relying on it.
 

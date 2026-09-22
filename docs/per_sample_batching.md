@@ -147,3 +147,27 @@ activation checkpointing as a last resort before giving up.
 Note the backoff must hand each attempt a fresh copy of the feature dict:
 `predict` consumes it, so a retry on the original dies with `KeyError: 'profile'`
 and the OOM is masked as a data error.
+
+## Landmine 3 (Protenix-v1 only): the in-place flag changes the trunk
+
+Measured on SteerABLE-v1 with `8c3l_D_#_C` (176 tokens, bf16, `--deterministic
+true`), running the pairformer trunk under different contexts and comparing
+`(s, z)` and the contact map bit for bit
+(`benchmarks/.../steerablev1_sanity/analysis/trunk_grad_probe.py`):
+
+| contexts compared | v1 max Δs / Δz / Δcontact | v2 (SteerABLE) |
+|---|---|---|
+| repeat of the same run | 0 / 0 / 0 | 0 / 0 / 0 |
+| in-place ops on vs off, both `no_grad` | **16 / 40 / 0.31** | 0 / 0 / 0 |
+| grad on vs off, in-place off in both | 0 / 0 / 0 | 0 / 0 / 0 |
+| activation checkpointing on vs off, grad on | 0 / 0 / 0 | 0 / 0 / 0 |
+
+`Protenix.forward` sets `inplace_safe = not torch.is_grad_enabled()`, so any
+run with an epitope configured computes its trunk with in-place ops off. On v2
+that is numerically invisible. On v1 it is not: 200 diffusion steps turn the
+rounding difference into different samples (12 Å apart on this target), so a
+gated run's `raw` branch is bit-identical to a `--gating.mode raw` run and to
+the steered branch's trunk, but **not** to a run without `--epitope_residue`.
+Compare steered against `raw` from the same `--gating.mode both` run, not
+against a separately produced baseline. This also applies to the historical
+EmAbAg benchmarks, whose baseline arm was a plain run.
