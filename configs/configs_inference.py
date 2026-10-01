@@ -42,20 +42,20 @@ inference_configs = {
     "use_rna_msa": False,
     "use_seeds_in_json": False,
     # -------------------------------------------------------------------
-    # SteerABLE-v1 epitope-guidance controls
+    # SteerABLE epitope-guidance controls
     # -------------------------------------------------------------------
     # `epitope_residue` acts as the on/off switch: when provided, epitope-guided
     # embedding steering is automatically active with the defaults below. Set
     # `ab_chains` to declare which chains are the antibody (heavy+light); the
     # antigen (partner) chains are inferred as the complement.
     #
-    # The `epitope.*` defaults below mirror SteerABLE (the Protenix-v2 sibling)
-    # so the two releases share one interface. NOTE for reproducing the v1
-    # (EmAbAg) benchmarks: those were produced with the steering gradient
-    # applied on EVERY step (`--epitope.guidance_interval 1`), bf16, and
-    # `--infer_setting.sample_diffusion_chunk_size 1`; `guidance_interval 8`
-    # was calibrated on Protenix-v2 and has not been re-validated on v1.
-    # Protenix-v1 has no Training-Free Guidance, so there is no TFG switch.
+    # The `epitope.*` defaults below are SteerABLE's recommended setting and are
+    # what the released benchmarks were produced with. Two further parts of that
+    # recommended setting live in configs shared with upstream Protenix and are
+    # therefore NOT defaulted here -- pass them on the command line:
+    #
+    #   --sample_diffusion.guidance.enable true    # TFG (upstream default: off)
+    #   --dtype fp32                               # (upstream default: bf16)
     #
     # See examples/steerable/7yds/run.sh for a ready-to-run invocation.
     #
@@ -113,7 +113,7 @@ inference_configs = {
         "guidance_interval": 8,
     },
     # -------------------------------------------------------------------
-    # Distogram routing gate (raw Protenix vs SteerABLE-v1 steering)
+    # Distogram routing gate (raw Protenix vs SteerABLE steering)
     # -------------------------------------------------------------------
     # The pairformer trunk already decides where the antibody sits, and the
     # distogram exposes it: score every antigen token by its best antibody
@@ -130,7 +130,7 @@ inference_configs = {
     #             normal output layout; the no-guidance run is dumped under
     #             <dump_dir>/raw/. No routing decision is made. Costs ~2x.
     #   route     run exactly ONE branch: enrichment >= threshold
-    #             => raw Protenix, else SteerABLE-v1 steering. Requires `threshold`.
+    #             => raw Protenix, else SteerABLE steering. Requires `threshold`.
     #   raw       no-guidance only (still reports enrichment).
     # Without `epitope_residue` there is nothing to steer or score, so the run
     # behaves exactly like upstream Protenix whatever `mode` says.
@@ -157,8 +157,7 @@ inference_configs = {
     # -------------------------------------------------------------------
     # `--blocks_per_ckpt null` keeps activations instead of recomputing them,
     # which buys 1.4-2.3x but costs memory: measured on a 48 GB A6000 it fits at
-    # 729 tokens and does not at 936 (measured on Protenix-v2, c_z=256; the v1
-    # trunk is narrower, so v1 has more headroom). With this flag on, a target above
+    # 729 tokens and does not at 936. With this flag on, a target above
     # ~800 tokens gets checkpointing restored up front so it completes instead
     # of OOM-ing. Set it to false to reproduce the published runs, which had no
     # such restore (see the reproduction section of the README).

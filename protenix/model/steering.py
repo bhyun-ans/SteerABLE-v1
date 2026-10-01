@@ -17,8 +17,8 @@ Reward-guided embedding steering for diffusion sampling (Ab–Ag specialised).
 
 Core idea: during reverse diffusion, steer trunk embeddings (s, z) via the
 gradient of a contact-based reward that encourages epitope (antigen)
-residues to make contacts with antibody atoms.  Unlike a generic
-contact-on-any-chain mode, the partner-atom mask is restricted to the
+residues to make contacts with antibody atoms.  Unlike the generic
+hotspot-on-any-chain mode, the partner-atom mask is restricted to the
 antibody chains supplied via ``ab_chain_ids``, so antigen-antigen
 inter-chain contacts are excluded — necessary for homo-multimeric antigens.
 """

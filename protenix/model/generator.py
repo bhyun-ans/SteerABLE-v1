@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 import torch
 
 from protenix.model.utils import centre_random_augmentation, expand_at_dim
+from protenix.tfg import parse_tfg_config, TFGEngine
 from protenix.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -145,6 +146,7 @@ def sample_diffusion(
     inplace_safe: bool = False,
     attn_chunk_size: Optional[int] = None,
     enable_efficient_fusion: bool = False,
+    guidance_configs: Optional[dict[str, Any]] = None,
     epitope_configs: Optional[dict[str, Any]] = None,
 ) -> torch.Tensor:
     """Implements Algorithm 18 in AF3.
@@ -177,8 +179,9 @@ def sample_diffusion(
         inplace_safe (bool): Whether to use inplace operations safely. Defaults to False.
         attn_chunk_size (Optional[int]): Chunk size for attention operation. Defaults to None.
         enable_efficient_fusion (bool): Whether to enable efficient fusion. Defaults to False.
-        epitope_configs (Optional[dict[str, Any]]): SteerABLE-v1 reward-guided embedding-steering configs. When provided,
-            trunk embeddings (s_τ, z_τ) are updated each step via the gradient of an epitope-contact reward evaluated
+        guidance_configs (Optional[dict[str, Any]]): training free guidance configs. Defaults to None.
+        epitope_configs (Optional[dict[str, Any]]): SteerABLE reward-guided embedding-steering configs. When provided,
+            trunk embeddings (s_τ, z_τ) are updated each step via the gradient of a hotspot-contact reward evaluated
             on the denoiser's raw x̂0 output. Expected keys: "mask_pairs" (from build_guidance_masks), plus optional
             "guidance_alpha" / "guidance_interval" / "alpha_init" / "alpha_trunc" / "d0" / "softmin_beta" /
             "lambda_clash" / "clash_tau" / "clash_start_step". "guidance_interval" (int >= 1, default 8)
@@ -186,8 +189,9 @@ def sample_diffusion(
             rest are plain no-grad sampler steps on the embeddings as they stand. alpha is still evaluated at the
             raw step index, so the cosine schedule's truncation point and "clash_start_step" keep their step-space
             meaning; only the density of updates changes, and the total steering applied scales as ~1/k.
-            Protenix-v1 has no Training-Free Guidance: x̂0 comes straight from `denoise_net` (the
-            DiffusionModule) and the coordinate update is the plain AF3 Euler step. Defaults to None (unguided).
+            Composes with TFG (`guidance_configs.enable=True`) — when both are on,
+            SteerABLE pulls the grad-attached x̂0 out of tfg.step(return_x0=True) so the two mechanisms share one denoise
+            call. Defaults to None (unguided).
 
     Returns:
         torch.Tensor: the denoised coordinates of x in inference stage
@@ -197,8 +201,12 @@ def sample_diffusion(
     batch_shape = s_inputs.shape[:-2]
     device = s_inputs.device
     dtype = s_inputs.dtype
+    tfg_cfg = parse_tfg_config(guidance_configs)
+    if tfg_cfg.enable:
+        logger.info("Guidance is enabled.")
+        tfg = TFGEngine(tfg_cfg, device=device, dtype=dtype)
 
-    # ---- SteerABLE-v1 epitope-reward-guided embedding steering ----
+    # ---- SteerABLE epitope-reward-guided embedding steering ----
     epitope_on = epitope_configs is not None and bool(epitope_configs)
     if epitope_on:
         from protenix.model.steering import (
@@ -275,10 +283,10 @@ def sample_diffusion(
         g_n_steer = len(g_steer_steps)
         logger.info(
             "Epitope embedding-guidance ON: d0=%.2f softmin_beta=%.2f "
-            "λ_clash=%.3f alpha_const=%s (schedule=%s) "
+            "λ_clash=%.3f alpha_const=%s (schedule=%s) tfg_compose=%s "
             "interval=%d (%d/%d steps steer)",
             g_d0, g_beta, g_lambda_clash,
-            g_alpha_const, g_alpha_schedule_fn is not None,
+            g_alpha_const, g_alpha_schedule_fn is not None, tfg_cfg.enable,
             g_interval, g_n_steer, g_total_steps,
         )
         if g_interval > 1:
@@ -425,33 +433,55 @@ def sample_diffusion(
                 epitope_active = False
 
             if epitope_active:
-                # ==== SteerABLE-v1 epitope-reward-guided branch ====
-                # x̂0 is the denoiser's own output (Protenix-v1 has no TFG stage
-                # to route it through), so the graph runs denoise_net -> reward
-                # -> (s_tau, z_tau) directly.
+                # ==== SteerABLE epitope-reward-guided branch (composes with TFG) ====
                 s_tau = s_tau.detach().requires_grad_(True)
                 z_tau = z_tau.detach().requires_grad_(True)
 
                 with torch.enable_grad():
-                    # Grad-enabled denoise on the steered embeddings, then the plain
-                    # AF3 Euler step (Alg. 18 line 9) on the detached x̂0 below.
-                    x0_pred = denoise_net(
-                        x_noisy=x_noisy,
-                        t_hat_noise_level=t_hat,
-                        input_feature_dict=input_feature_dict,
-                        s_inputs=s_inputs,
-                        s_trunk=s_tau,
-                        z_trunk=z_tau,
-                        pair_z=cur_pair_z,
-                        p_lm=cur_p_lm,
-                        c_l=cur_c_l,
-                        chunk_size=attn_chunk_size,
-                        inplace_safe=False,
-                        enable_efficient_fusion=False,
-                    )
-                    delta = (x_noisy - x0_pred) / t_hat[..., None, None]
-                    dt = c_tau - t_hat
-                    x_next = x_noisy + step_scale_eta * dt[..., None, None] * delta
+                    if tfg_cfg.enable:
+                        # TFG shares its Stage-2 denoise with us via return_x0.
+                        # x0_pred has autograd graph → reward → grad wrt s_tau/z_tau.
+                        # x_next is the fully TFG-processed x_{t-1} (PDM + refinement + Euler).
+                        x_next, x0_pred = tfg.step(
+                            denoise_net,
+                            x=x_noisy,
+                            t_hat=t_hat,
+                            input_feature_dict=input_feature_dict,
+                            s_inputs=s_inputs,
+                            s_trunk=s_tau,
+                            z_trunk=z_tau,
+                            pair_z=cur_pair_z,
+                            p_lm=cur_p_lm,
+                            c_l=cur_c_l,
+                            chunk_size=attn_chunk_size,
+                            inplace_safe=False,
+                            enable_efficient_fusion=False,
+                            c_tau=c_tau,
+                            step_i=step_i,
+                            num_diffusion_steps=len(noise_schedule) - 1,
+                            step_scale_eta=step_scale_eta,
+                            return_x0=True,
+                        )
+                    else:
+                        # Epitope-only branch: run the grad-enabled denoise directly
+                        # and do the plain AF3 Euler step (no TFG projection).
+                        x0_pred = denoise_net(
+                            x_noisy=x_noisy,
+                            t_hat_noise_level=t_hat,
+                            input_feature_dict=input_feature_dict,
+                            s_inputs=s_inputs,
+                            s_trunk=s_tau,
+                            z_trunk=z_tau,
+                            pair_z=cur_pair_z,
+                            p_lm=cur_p_lm,
+                            c_l=cur_c_l,
+                            chunk_size=attn_chunk_size,
+                            inplace_safe=False,
+                            enable_efficient_fusion=False,
+                        )
+                        delta = (x_noisy - x0_pred) / t_hat[..., None, None]
+                        dt = c_tau - t_hat
+                        x_next = x_noisy + step_scale_eta * dt[..., None, None] * delta
 
                     # Reward evaluated on grad-attached x̂0 (not on x_next which
                     # is Euler-stepped noisy waypoint). Backprop to s_tau/z_tau.
@@ -576,17 +606,12 @@ def sample_diffusion(
                     )
                     truncation_logged = True
 
-                # Plain AF3 Euler step on the frozen steered embeddings.
-                # no_grad is what makes this the runtime win the comment
-                # above promises: grad is enabled process-wide while epitope
-                # guidance is configured, so without it the denoiser still
-                # builds a graph through its parameters — which also leaves
-                # x_l requiring grad and makes the dumper fail on
-                # `pred_coordinate.cpu().numpy()`.
-                with torch.no_grad():
-                    x_denoised = denoise_net(
-                        x_noisy=x_noisy,
-                        t_hat_noise_level=t_hat,
+                if tfg_cfg.enable:
+                    # Hand the frozen s_tau/z_tau to TFG's own (unchanged) update.
+                    x_l = tfg.step(
+                        denoise_net,
+                        x=x_noisy,
+                        t_hat=t_hat,
                         input_feature_dict=input_feature_dict,
                         s_inputs=s_inputs,
                         s_trunk=s_tau,
@@ -597,13 +622,76 @@ def sample_diffusion(
                         chunk_size=attn_chunk_size,
                         inplace_safe=inplace_safe,
                         enable_efficient_fusion=enable_efficient_fusion,
+                        c_tau=c_tau,
+                        step_i=step_i,
+                        num_diffusion_steps=len(noise_schedule) - 1,
+                        step_scale_eta=step_scale_eta,
                     )
-                    delta = (x_noisy - x_denoised) / t_hat[..., None, None]
-                    dt = c_tau - t_hat
-                    x_l = x_noisy + step_scale_eta * dt[..., None, None] * delta
+                    # Belt-and-braces detach. Grad is enabled process-wide
+                    # while guidance is configured, and this is the only denoise
+                    # site in the guided sampler whose result is neither wrapped
+                    # in no_grad (unlike the else-branch below) nor detached
+                    # (unlike branch (a)'s `x_l = x_next.detach()`). It is
+                    # graph-free today only because tfg.step runs Stage 2 under
+                    # no_grad when return_x0=False, detaches x0 before Stages
+                    # 3-5, and detaches xt_shift -- accidents that hold at
+                    # rho=0.0 and with analytic potentials. With an interval
+                    # this branch becomes the majority path and, for any k that
+                    # does not divide N_step-1, produces the FINAL x_l, where a
+                    # stray graph makes the dumper fail on
+                    # `pred_coordinate.cpu().numpy()`. Value-identical, so this
+                    # cannot perturb the default path.
+                    x_l = x_l.detach()
+                else:
+                    # Plain AF3 Euler step on the frozen steered embeddings.
+                    # no_grad is what makes this the runtime win the comment
+                    # above promises: grad is enabled process-wide while epitope
+                    # guidance is configured, so without it the denoiser still
+                    # builds a graph through its parameters — which also leaves
+                    # x_l requiring grad and makes the dumper fail on
+                    # `pred_coordinate.cpu().numpy()`.
+                    with torch.no_grad():
+                        x_denoised = denoise_net(
+                            x_noisy=x_noisy,
+                            t_hat_noise_level=t_hat,
+                            input_feature_dict=input_feature_dict,
+                            s_inputs=s_inputs,
+                            s_trunk=s_tau,
+                            z_trunk=z_tau,
+                            pair_z=cur_pair_z,
+                            p_lm=cur_p_lm,
+                            c_l=cur_c_l,
+                            chunk_size=attn_chunk_size,
+                            inplace_safe=inplace_safe,
+                            enable_efficient_fusion=enable_efficient_fusion,
+                        )
+                        delta = (x_noisy - x_denoised) / t_hat[..., None, None]
+                        dt = c_tau - t_hat
+                        x_l = x_noisy + step_scale_eta * dt[..., None, None] * delta
 
+            elif tfg_cfg.enable:
+                # ==== TFG-only branch (unchanged from upstream v2) ====
+                x_l = tfg.step(
+                    denoise_net,
+                    x=x_noisy,
+                    t_hat=t_hat,
+                    input_feature_dict=input_feature_dict,
+                    s_inputs=s_inputs,
+                    s_trunk=s_trunk,
+                    z_trunk=z_trunk,
+                    pair_z=pair_z,
+                    p_lm=p_lm,
+                    c_l=c_l,
+                    chunk_size=attn_chunk_size,
+                    inplace_safe=inplace_safe,
+                    enable_efficient_fusion=enable_efficient_fusion,
+                    c_tau=c_tau,
+                    step_i=step_i,
+                    num_diffusion_steps=len(noise_schedule) - 1,
+                    step_scale_eta=step_scale_eta,
+                )
             else:
-                # ==== Baseline branch (unchanged from upstream Protenix-v1) ====
+                # ==== Baseline branch (unchanged from upstream v2) ====
                 x_denoised = denoise_net(
                     x_noisy=x_noisy,
                     t_hat_noise_level=t_hat,

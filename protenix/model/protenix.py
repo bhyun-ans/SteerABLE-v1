@@ -449,6 +449,13 @@ class Protenix(nn.Module):
                 ),
             }
         )
+        _configs.update(
+            {
+                "guidance_configs": self.configs.sample_diffusion.to_dict().get(
+                    "guidance"
+                )
+            }
+        )
         # `epitope_configs` is injected at the caller site (_main_inference_loop)
         # after the mask_pairs are built from the live input_feature_dict, so
         # it arrives in **kwargs. We do not read it from self.configs directly.
@@ -1002,6 +1009,11 @@ class Protenix(nn.Module):
                 "threshold": gate_threshold,
                 "branches_run": list(branch_names),
                 "routed_branch": routed_branch,
+                "tfg_enabled": bool(
+                    (
+                        self.configs.sample_diffusion.to_dict().get("guidance") or {}
+                    ).get("enable", False)
+                ),
                 "N_token": int(N_token),
                 "N_sample": int(N_sample),
                 "N_step": int(N_step),

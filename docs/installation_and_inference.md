@@ -1,10 +1,10 @@
 # Installation and inference
 
-How to install SteerABLE-v1 and run it. For the epitope-steering options specifically,
+How to install SteerABLE and run it. For the epitope-steering options specifically,
 see the main [README](../README.md); this document covers the inference machinery
-SteerABLE-v1 inherits from Protenix-v1.
+SteerABLE inherits from Protenix-v2.
 
-SteerABLE-v1 is inference-only. The upstream training and fine-tuning stack is not
+SteerABLE is inference-only. The upstream training and fine-tuning stack is not
 part of this repository; if you need it, use
 [Protenix](https://github.com/bytedance/Protenix) directly.
 
@@ -12,12 +12,12 @@ part of this repository; if you need it, use
 
 ### From source
 ```bash
-git clone https://github.com/bhyun-ans/SteerABLE-v1.git
-cd SteerABLE-v1
+git clone https://github.com/bhyun-ans/SteerABLE.git
+cd SteerABLE
 pip3 install -e .
 ```
 
-This installs the `steerable-v1` command. SteerABLE-v1 is not published on PyPI.
+This installs the `steerable` command. SteerABLE is not published on PyPI.
 
 ### Docker
 Check the detailed guide: [<u> Docker Installation</u>](./docker_installation.md).
@@ -28,18 +28,18 @@ For features such as **Template search** and **RNA MSA search**, additional syst
 - **hmmer**: Used for sequence profile searches.
 
 **Note**:
-- **Docker Users**: These dependencies are already pre-installed in the upstream Protenix Docker image, which SteerABLE-v1 uses unchanged.
+- **Docker Users**: These dependencies are already pre-installed in the upstream Protenix Docker image, which SteerABLE uses unchanged.
 - **Non-Docker Users**: You must install them manually. On Ubuntu/Debian, run:
   ```bash
   apt-get update && apt-get install -y kalign hmmer
   ```
   Or, you can provide the paths to the binaries built from source via command-line arguments (e.g.,`--kalign_binary_path`, `--hmmsearch_binary_path`, `--hmmbuild_binary_path`, `--nhmmer_binary_path`, etc.).
-  For more information, refer to `steerable-v1 pred -h`.
+  For more information, refer to `steerable pred -h`.
 
 
 ## 🚀 Inference & CLI Usage
 
-SteerABLE-v1 provides a unified CLI for structure prediction, data preprocessing, and database searching, under the `steerable-v1` command.
+SteerABLE provides a unified CLI for structure prediction, data preprocessing, and database searching, under the `steerable` command.
 
 ### CLI Commands Overview
 | Command | Alias | Description |
@@ -54,25 +54,27 @@ SteerABLE-v1 provides a unified CLI for structure prediction, data preprocessing
 Convert structural files into the required JSON format.
 ```bash
 # Convert PDB/CIF to JSON
-steerable-v1 json --input ./your_structure.pdb --out_dir ./output --altloc first
+steerable json --input ./your_structure.pdb --out_dir ./output --altloc first
 
 # Advanced: Specify assembly ID for biological assemblies
 wget https://files.rcsb.org/download/7pzb.cif
-steerable-v1 json --input ./7pzb.cif --out_dir ./output --altloc first
+steerable json --input ./7pzb.cif --out_dir ./output --altloc first
 
+# Advanced: Keep discontinuous polymer-polymer bonds (e.g. cyclic-peptide)
+steerable json --input ./your_cyclic_peptide.cif --out_dir ./output --altloc first --include_discont_poly_poly_bonds
 ```
 
 ### 2. Input Preprocessing (`prep`, `mt`, `msa`)
 Protenix requires MSA and template information for optimal accuracy.
 ```bash
 # Full preprocessing (Protein MSA + Template + RNA MSA)
-steerable-v1 prep --input your_input.json --out_dir ./output
+steerable prep --input your_input.json --out_dir ./output
 
 # Sequential Protein MSA and Template search
-steerable-v1 mt --input your_input.json --out_dir ./output
+steerable mt --input your_input.json --out_dir ./output
 
 # Independent MSA search (supports JSON or Protein FASTA)
-steerable-v1 msa --input your_sequences.fasta --out_dir ./output --msa_server_mode protenix
+steerable msa --input your_sequences.fasta --out_dir ./output --msa_server_mode protenix
 ```
 
 > **Note**: For `prep` and `mt`, you may need to specify paths to external databases (e.g., `--seqres_database_path`) and HMMER binaries if they are not in your system PATH.
@@ -83,26 +85,27 @@ The bundled example is `examples/steerable/7yds/7yds.json`; run
 `bash examples/steerable/7yds/prepare.sh` once to unpack its MSAs.
 
 ```bash
-# Epitope-steered prediction -- the SteerABLE-v1 defaults
-steerable-v1 pred -i examples/steerable/7yds/7yds.json -o ./output \
-    -s 101 -n protenix_base_default_v1.0.0 \
+# Epitope-steered prediction -- the recommended SteerABLE setting
+steerable pred -i examples/steerable/7yds/7yds.json -o ./output \
+    -s 101 -n protenix-v2 --dtype fp32 --use_tfg_guidance true \
     --ab_chains "$(cat examples/steerable/7yds/ab_chains.txt)" \
     --epitope_residue "$(cat examples/steerable/7yds/epitope.txt)"
 
-# No epitope: plain Protenix-v1
-steerable-v1 pred -i examples/steerable/7yds/7yds.json -o ./output -s 101 -n protenix_base_default_v1.0.0
+# No epitope: plain Protenix-v2
+steerable pred -i examples/steerable/7yds/7yds.json -o ./output -s 101 -n protenix-v2
 
 # Seeds taken from the input JSON
-steerable-v1 pred -i your_input.json --use_seeds_in_json true
+steerable pred -i your_input.json --use_seeds_in_json true
 
 # Disable MSA (much faster, much less accurate -- use for smoke tests only)
-steerable-v1 pred -i your_input.json --use_msa false --enable_cache true
+steerable pred -i your_input.json --use_msa false --enable_cache true
 ```
 
 #### Key Inference Flags
 - `--seeds`: Comma-separated list of random seeds (e.g., `101,102`).
-- `--model_name`: Model checkpoint. Use `protenix_base_default_v1.0.0`, the checkpoint the v1 benchmarks were produced on. The other Protenix-v1 checkpoints (`protenix_base_20250630_v1.0.0`, the 0.5.0 family) still load but have not been validated with epitope steering. Protenix-v2 checkpoints belong to the sibling [SteerABLE](https://github.com/bhyun-ans/SteerABLE) release.
+- `--model_name`: Model checkpoint. Use `protenix-v2`, which is what SteerABLE was calibrated and benchmarked on. The other upstream Protenix checkpoints still load but have not been validated with epitope steering.
 - `--use_default_params`: (Default: `true`) Automatically configures cycles and steps based on the selected model. Set to `false` to manually override `--cycle` and `--step`.
+- `--use_tfg_guidance`: Enable Training-Free Guidance (TFG) for refined sampling. Off by default, as upstream; SteerABLE recommends `true`.
 - `--ab_chains` / `--epitope_residue`: Turn on epitope steering. See the [README](../README.md).
 - `--use_msa` / `--use_template` / `--use_rna_msa`: (Default: `true`/`false`/`false`) Toggle specific features for inference.
 - `--dtype`: Set data type to `bf16` (default) or `fp32`.
@@ -112,9 +115,9 @@ steerable-v1 pred -i your_input.json --use_msa false --enable_cache true
 ### Worked examples
 
 `inference_demo.sh` at the repository root runs the bundled 7yds example through
-every mode -- the defaults, several epitope sets off one trunk, the paired
-steered-vs-unguided comparison, plain Protenix, the runner entry point, and the
-settings that reproduce the v1 benchmarks. Read it as the reference for what
+every mode -- the recommended setting, several epitope sets off one trunk, the
+paired steered-vs-unguided comparison, plain Protenix, the runner entry point,
+and the published-run reproduction settings. Read it as the reference for what
 each flag does:
 
 ```bash

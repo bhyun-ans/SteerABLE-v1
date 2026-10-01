@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# SteerABLE-v1's own release version. The underlying fork point is Protenix-v1
-# (upstream 1.0.5, checkpoint protenix_base_default_v1.0.0); see the README's
-# attribution section. The sibling SteerABLE release is built on Protenix-v2.
+# SteerABLE's own release version. The underlying Protenix fork point is
+# Protenix-v2 (2.0.0); see the README's attribution section.
 __version__ = "1.0.0"

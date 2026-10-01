@@ -137,7 +137,7 @@ wandb/
 output/
 release_data/
 
-# ---- SteerABLE-v1 ----
+# ---- SteerABLE ----
 # Example MSAs ship gzipped; prepare.sh unpacks them next to the archives.
 examples/steerable/*/msa/*/*.a3m
 # Demo/verification output directories

@@ -25,7 +25,7 @@ bash examples/steerable/7yds/run.sh
 ```
 
 `prepare.sh` gunzips the bundled MSAs (5.4 MB packed, 24.6 MB unpacked).
-`run.sh` uses the defaults and explains every knob in comments.
+`run.sh` holds the recommended setting and explains every knob in comments.
 
 The model checkpoint downloads itself on first use. Set `PROTENIX_ROOT_DIR` if
 you want it somewhere other than `~/checkpoint`.
@@ -51,7 +51,7 @@ output/7yds_steerable/7yds/seed_101/predictions/
 `7yds_gating.json` is the record of what the steering actually did. Check:
 
 - `epitope_guidance_interval` is `8`, and the steering trace covers 25 of the
-  200 diffusion steps (the v1 benchmarks used interval 1, i.e. all 200). The run log says the same thing:
+  200 diffusion steps. The run log says the same thing:
   `interval=8 (25/200 steps steer)`.
 - `enrichment` — how much the *unsteered* pairformer trunk already favoured
   your epitope. Roughly 1 means the trunk had no opinion, so steering has the
@@ -72,19 +72,18 @@ To confirm the install works before committing to a real run, drop the MSAs.
 It is much faster and much less accurate:
 
 ```bash
-steerable-v1 pred -i examples/steerable/7yds/7yds.json -o ./output/smoke \
-    --model_name protenix_base_default_v1.0.0 --use_msa false --seeds 101 \
+steerable pred -i examples/steerable/7yds/7yds.json -o ./output/smoke \
+    --model_name protenix-v2 --use_msa false --seeds 101 \
+    --dtype fp32 --use_tfg_guidance true \
     --ab_chains "$(cat examples/steerable/7yds/ab_chains.txt)" \
     --epitope_residue "$(cat examples/steerable/7yds/epitope.txt)"
 ```
 
 ## Using your own target
 
-1. Write a JSON in the same shape: one `proteinChain` per chain, and either
-   `pairedMsaPath`/`unpairedMsaPath` or no MSA fields at all (then use
-   `steerable-v1 msa` to generate them). Protenix-v1 letters the chains A, B,
-   C, … in the order they appear in `sequences`; it does not read a per-chain
-   `id` field.
+1. Write a JSON in the same shape: one `proteinChain` per chain, `id` giving
+   the chain letter, and either `pairedMsaPath`/`unpairedMsaPath` or no MSA
+   fields at all (then use `steerable msa` to generate them).
 2. Name the antibody chains in `--ab_chains`. Everything else is the antigen.
 3. Write the epitope as `<chain>:<position>` pairs, comma separated, using
    **1-based positions into the sequence you put in the JSON** — not author or

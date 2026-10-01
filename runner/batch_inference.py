@@ -302,6 +302,7 @@ def get_default_runner(
     use_seeds_in_json: bool = False,
     need_atom_confidence: bool = False,
     kalign_binary_path: Optional[str] = None,
+    use_tfg_guidance: bool = False,
     ab_chains: Optional[str] = None,
     epitope_residue: Optional[str] = None,
     epitope_guidance_alpha: float = 0.1,
@@ -329,6 +330,7 @@ def get_default_runner(
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds defined in the JSON file.
         kalign_binary_path (Optional[str]): Path to kalign binary.
+        use_tfg_guidance (bool): Whether to use TFG guidance.
         ab_chains (Optional[str]): Antibody/binder chains, e.g. "A,B". Required
             when epitope_residue is set; the antigen is the complement.
         epitope_residue (Optional[str]): Epitope residues to steer towards,
@@ -355,6 +357,12 @@ def get_default_runner(
     model_name_parts = model_name.split("_", 3)
     if len(model_name_parts) == 4:
         _, model_size, model_feature, model_version = model_name_parts
+    elif model_name == "protenix-v2":
+        # The model naming convention has been simplified for newer versions.
+        # Hardcoding these values here to maintain backward compatibility.
+        model_size = "464M"
+        model_feature = "default"
+        model_version = "v2"
     else:
         model_size = "unknown"
         model_feature = "unknown"
@@ -415,8 +423,9 @@ def get_default_runner(
                     "3. Download from: https://github.com/TimoLassmann/kalign\n"
                     "After installation, make sure the binary is accessible in PATH or provide kalign_binary_path."
                 )
+    configs.sample_diffusion.guidance.enable = use_tfg_guidance
 
-    # ---- SteerABLE-v1 epitope steering ----
+    # ---- SteerABLE epitope steering ----
     # `epitope_residue` is the on/off switch. The remaining knobs already carry
     # their recommended values as config defaults (configs/configs_inference.py);
     # what is set here are the CLI overrides of those defaults.
@@ -435,12 +444,17 @@ def get_default_runner(
         configs.gating.mode = gating_mode
         n_sets = len([x for x in epitope_residue.split(";") if x.strip()])
         logger.info(
-            f"SteerABLE-v1 epitope steering ON: ab_chains={ab_chains}, "
+            f"SteerABLE epitope steering ON: ab_chains={ab_chains}, "
             f"{n_sets} epitope set(s), alpha={epitope_guidance_alpha}, "
             f"lambda_clash={epitope_lambda_clash}, "
             f"guidance_interval={epitope_guidance_interval}, "
-            f"gating.mode={gating_mode}"
+            f"gating.mode={gating_mode}, TFG={use_tfg_guidance}"
         )
+        if not use_tfg_guidance:
+            logger.warning(
+                "TFG is off. The recommended SteerABLE setting is "
+                "--use_tfg_guidance true (and --dtype fp32)."
+            )
     elif ab_chains:
         logger.warning(
             "--ab_chains was given without --epitope_residue, so nothing will "
@@ -487,6 +501,7 @@ def inference_jsons(
     use_seeds_in_json: bool = False,
     need_atom_confidence: bool = False,
     kalign_binary_path: Optional[str] = None,
+    use_tfg_guidance: bool = False,
     ab_chains: Optional[str] = None,
     epitope_residue: Optional[str] = None,
     epitope_guidance_alpha: float = 0.1,
@@ -527,6 +542,7 @@ def inference_jsons(
         use_rna_msa (bool): Whether to use RNA MSA.
         use_seeds_in_json (bool): Whether to use seeds from JSON.
         kalign_binary_path (Optional[str]): Path to kalign binary.
+        use_tfg_guidance (bool): Use TFG guidance.
         ab_chains (Optional[str]): Antibody/binder chains, e.g. "A,B". Required
             when epitope_residue is set; the antigen is the complement.
         epitope_residue (Optional[str]): Epitope residues to steer towards,
@@ -584,6 +600,7 @@ def inference_jsons(
         use_seeds_in_json=use_seeds_in_json,
         need_atom_confidence=need_atom_confidence,
         kalign_binary_path=kalign_binary_path,
+        use_tfg_guidance=use_tfg_guidance,
         ab_chains=ab_chains,
         epitope_residue=epitope_residue,
         epitope_guidance_alpha=epitope_guidance_alpha,
@@ -645,9 +662,9 @@ class SuggestGroup(click.Group):
 @click.version_option(version=__version__)
 def protenix_cli() -> None:
     """
-    SteerABLE-v1: epitope-steered antibody-antigen structure prediction.
+    SteerABLE: epitope-steered antibody-antigen structure prediction.
 
-    Built on Protenix-v1. Without --epitope_residue this behaves exactly like
+    Built on Protenix-v2. Without --epitope_residue this behaves exactly like
     upstream Protenix; with it, the pairformer trunk embeddings are steered at
     inference time towards the epitope you name.
 
@@ -755,6 +772,15 @@ def protenix_cli() -> None:
     help="Path to kalign (searches in PATH if not provided).",
 )
 @click.option(
+    "--use_tfg_guidance",
+    type=bool,
+    default=False,
+    help=(
+        "Use Training-Free Guidance (TFG) for inference. Off by default, as "
+        "upstream. SteerABLE's recommended setting is true."
+    ),
+)
+@click.option(
     "--ab_chains",
     type=str,
     default=None,
@@ -790,9 +816,8 @@ def protenix_cli() -> None:
     type=int,
     default=8,
     help=(
-        "Apply the steering gradient on every k-th diffusion step. The default "
-        "8 was calibrated on Protenix-v2; the Protenix-v1 benchmarks used 1. "
-        "Total steering scales as ~1/k, so this is not a pure speed knob."
+        "Apply the steering gradient on every k-th diffusion step (recommended: "
+        "8). Total steering scales as ~1/k, so this is not a pure speed knob."
     ),
 )
 @click.option(
@@ -886,6 +911,7 @@ def predict(
     use_seeds_in_json: bool,
     need_atom_confidence: bool,
     kalign_binary_path: Optional[str] = None,
+    use_tfg_guidance: bool = False,
     ab_chains: Optional[str] = None,
     epitope_residue: Optional[str] = None,
     epitope_guidance_alpha: float = 0.1,
@@ -928,6 +954,7 @@ def predict(
         use_seeds_in_json (bool): Use seeds from JSON.
         need_atom_confidence (bool): Compute atom-level confidence scores.
         kalign_binary_path (Optional[str]): Path to kalign binary.
+        use_tfg_guidance (bool): Use TFG guidance.
         ab_chains (Optional[str]): Antibody/binder chains, e.g. "A,B". Required
             when epitope_residue is set; the antigen is the complement.
         epitope_residue (Optional[str]): Epitope residues to steer towards,
@@ -957,6 +984,7 @@ def predict(
             "protenix_base_constraint_v0.5.0",
             "protenix_base_default_v1.0.0",
             "protenix_base_20250630_v1.0.0",
+            "protenix-v2",
         ]:
             cycle = 10
             step = 200
@@ -995,7 +1023,8 @@ def predict(
         assert model_name in [
             "protenix_base_default_v1.0.0",
             "protenix_base_20250630_v1.0.0",
-        ], "Only protenix_base_default_v1.0.0 and protenix_base_20250630_v1.0.0 supports template inference."
+            "protenix-v2",
+        ], "Only protenix_base_default_v1.0.0, protenix_base_20250630_v1.0.0 and protenix-v2 supports template inference."
         logger.info("=" * 50)
         logger.info(
             "Using templates for inference. Template files should have "
@@ -1010,7 +1039,8 @@ def predict(
         assert model_name in [
             "protenix_base_default_v1.0.0",
             "protenix_base_20250630_v1.0.0",
-        ], "Only protenix_base_default_v1.0.0 and protenix_base_20250630_v1.0.0 supports RNA MSA inference."
+            "protenix-v2",
+        ], "Only protenix_base_default_v1.0.0, protenix_base_20250630_v1.0.0 and protenix-v2 supports RNA MSA inference."
         logger.info("=" * 50)
         logger.info(
             "Using RNA MSA for inference. RNA MSA files should have .a3m "
@@ -1029,7 +1059,10 @@ def predict(
             "using seeds from modelSeeds defined in the JSON."
         )
         logger.info("=" * 50)
-
+    if use_tfg_guidance:
+        logger.info("=" * 50)
+        logger.info("Using Training-Free Guidance (TFG) for inference.\n")
+        logger.info("=" * 50)
     inference_jsons(
         input,
         out_dir,
@@ -1051,6 +1084,7 @@ def predict(
         use_seeds_in_json=use_seeds_in_json,
         need_atom_confidence=need_atom_confidence,
         kalign_binary_path=kalign_binary_path,
+        use_tfg_guidance=use_tfg_guidance,
         ab_chains=ab_chains,
         epitope_residue=epitope_residue,
         epitope_guidance_alpha=epitope_guidance_alpha,
@@ -1094,11 +1128,18 @@ def predict(
     type=str,
     help="Assembly ID for structure extension (default: no extension).",
 )
+@click.option(
+    "--include_discont_poly_poly_bonds",
+    default=False,
+    is_flag=True,
+    help="Whether to include discontinuous polymer-polymer bonds.",
+)
 def tojson(
     input: str,
     out_dir: str = "./output",
     altloc: str = "first",
     assembly_id: Optional[str] = None,
+    include_discont_poly_poly_bonds: bool = False,
 ) -> List[str]:
     """
     Convert PDB or CIF files to JSON files for Protenix inference.
@@ -1108,6 +1149,7 @@ def tojson(
         out_dir (str): Output directory for JSON files.
         altloc (str): Alternate location conformation selection.
         assembly_id (Optional[str]): Assembly ID for structure extension.
+        include_discont_poly_poly_bonds (bool): Whether to include discontinuous polymer-polymer bonds.
 
     Returns:
         List[str]: List of generated JSON file paths.
@@ -1116,6 +1158,7 @@ def tojson(
     logger.info(
         f"Run tojson with input={input}, out_dir={out_dir}, "
         f"altloc={altloc}, assembly_id={assembly_id}"
+        f", include_discont_poly_poly_bonds={include_discont_poly_poly_bonds}"
     )
     input_files = []
     if not os.path.exists(input):
@@ -1153,6 +1196,7 @@ def tojson(
                     altloc=altloc,
                     sample_name=pdb_name,
                     output_json=output_json,
+                    include_discont_poly_poly_bonds=include_discont_poly_poly_bonds,
                 )
         elif input_file.endswith(".cif"):
             cif_to_input_json(
@@ -1160,6 +1204,7 @@ def tojson(
                 assembly_id=assembly_id,
                 altloc=altloc,
                 output_json=output_json,
+                include_discont_poly_poly_bonds=include_discont_poly_poly_bonds,
             )
         else:
             raise RuntimeError(f"can not read a special ligand_file: {input_file}")

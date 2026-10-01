@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to SteerABLE-v1 are documented here. Changes inherited from
+All notable changes to SteerABLE are documented here. Changes inherited from
 upstream Protenix are not restated; see the
 [Protenix changelog](https://github.com/bytedance/Protenix) for those.
 
@@ -9,20 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0]
 
-First release. Fork point: Protenix-v1 (upstream 1.0.5, checkpoint
-`protenix_base_default_v1.0.0`), by way of EmAbAg, the epitope-steering fork
-that produced the v1 benchmarks. SteerABLE-v1 is the Protenix-v1 counterpart of
-[SteerABLE](https://github.com/bhyun-ans/SteerABLE), which is built on
-Protenix-v2; the two share one interface and one steering algorithm.
+First public release. Fork point: Protenix-v2 (2.0.0). The accompanying
+preprint is in preparation.
 
 ### Added
 - **Embedding-space epitope steering.** A differentiable contact reward on the
   denoiser's clean-structure prediction back-propagates to the pairformer trunk
   embeddings `(s, z)`, which are carried as steerable state across the diffusion
   trajectory. `--epitope_residue` turns it on; `--ab_chains` says which side of
-  the interface is the antibody. Protenix-v1 has no Training-Free Guidance, so
-  x̂₀ is read straight from the DiffusionModule and the coordinate update is
-  the plain AF3 Euler step.
+  the interface is the antibody.
+- **Composition with Training-Free Guidance.** `TFGEngine.step(return_x0=True)`
+  runs its Stage-2 denoise under `enable_grad` and returns the graph-attached
+  `x̂₀`, so coordinate-space TFG and embedding-space steering share a single
+  denoiser forward instead of paying for two.
 - **Several epitope hypotheses off one trunk.** `--epitope_residue "a;b;c"`
   computes the pairformer trunk and its distogram once, then samples one steered
   branch per set into `steerable_<k>/`. Branches share the trunk, the initial
@@ -38,35 +37,23 @@ Protenix-v2; the two share one interface and one steering algorithm.
 - **Clash penalty.** An optional antibody × antigen van der Waals overlap term,
   on by default at `lambda_clash = 0.1`.
 - `--epitope.guidance_interval`: apply the steering gradient on every k-th step.
-- `--auto_restore_activation_checkpointing` and an OOM backoff that halves the
-  diffusion sample chunk, then restores activation checkpointing, instead of
-  losing a target. `--blocks_per_ckpt null` (no activation checkpointing) is
-  therefore safe to use for speed.
+- `--auto_restore_activation_checkpointing`: set false to reproduce the
+  published runs, which had no large-target checkpointing safety net.
+- OOM backoff that halves the diffusion sample chunk instead of losing a target.
 - `examples/steerable/7yds/`: a complete runnable example with bundled MSAs.
 
 ### Changed
-- The distribution and console command are `steerable-v1`. The importable
-  package is still `protenix`, so this tree keeps diffing cleanly against
-  upstream Protenix-v1.
-- Epitope defaults mirror SteerABLE: `guidance_alpha` 0.1, `lambda_clash` 0.1,
-  `guidance_interval` 8, `gating.mode` `steerable`. Note that the v1 benchmarks
-  (EmAbAg) were produced with the gradient applied on every step; see the
-  README's reproduction section.
-- The epitope options live under `--epitope.*` (was `--guidance.*` in EmAbAg).
-
-### Known behaviour
-- On Protenix-v1 the pairformer trunk computed with in-place ops disabled (as
-  every grad-enabled, i.e. epitope-configured, run does) differs from the plain
-  in-place trunk at bf16 rounding level; on Protenix-v2 the two are identical.
-  A gated run's `raw` branch therefore matches its steered sibling's trunk but
-  not a separate run without `--epitope_residue`. Grad mode and activation
-  checkpointing do not change the trunk. See the README.
+- The distribution and console command are `steerable`. The importable package
+  is still `protenix`, so this tree keeps diffing cleanly against upstream.
+- Epitope defaults now carry the recommended setting: `guidance_alpha` 0.1,
+  `lambda_clash` 0.1, `guidance_interval` 8, `gating.mode` `steerable`.
+- Settings shared with upstream Protenix keep upstream's defaults. The two that
+  the recommended setting changes, TFG (`--use_tfg_guidance true`) and precision
+  (`--dtype fp32`), must be passed explicitly. See `examples/steerable/7yds/run.sh`.
+- `predict()` in the CLI accepts the epitope options; previously they existed
+  only on `runner/inference.py`.
 
 ### Removed
-- The training and fine-tuning stack, training-data preparation scripts and
-  the upstream benchmark reports (inference-only release).
-- EmAbAg's `--guidance.top_k` knob: the contact penalty always uses the single
-  closest atom of each epitope residue (k = 1).
-- EmAbAg's `--save_trajectory` (multi-model PDB trajectory + PyMOL view) and the
-  per-sample `reward_history` in the summary-confidence JSON. The per-step,
-  per-sample reward trace now lives in `<name>_gating.json`.
+- The top-k atom selection knob. The contact penalty always uses the single
+  closest atom of each epitope residue (k = 1), which is what the released
+  model was calibrated and benchmarked with.

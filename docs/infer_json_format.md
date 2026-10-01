@@ -59,6 +59,7 @@ There are 5 kinds of supported sequences:
 ```
 * `sequence`: A string representating a protein sequence, which can only contain the 20 standard amino acid type and X (UNK) for unknown residues.
 * `count`: The number of copies of this protein chain (integer).
+* `id` (optional): Manually specify the chain IDs of the entity using a list of strings. The length of the list must be equal to the value of `count`, e.g. `"id": ["H", "L"]`.
 * `modifications`: An optional list of dictionaries that describe post-translational modifications.
   * `ptmType`: A string containing CCD code of the modification. 
   * `ptmPosition`: The position of the modified amino acid (integer).
@@ -102,6 +103,7 @@ the sequence of the reverse complement strand.
 
 * `sequence`: A string containing a DNA sequence; only letters A, T, G, C and N (unknown ribonucleotide) are allowed.
 * `count`: The number of copies of this DNA chain (integer).
+* `id` (optional): Manually specify the chain IDs of the entity using a list of strings. The length of the list must be equal to the value of `count`, e.g. `"id": ["H", "L"]`.
 * `modifications`: An optional list of dictionaries describing of
 the DNA chemical modifications:
   * `modificationType`: A string containing CCD code of modification.
@@ -129,6 +131,7 @@ the DNA chemical modifications:
 ```
 * `sequence`: A string representing the RNA sequence (single-stranded); only letters A, U, G, C and N (unknown nucleotides) are allowed.
 * `count`: The number of copies of this RNA chain (integer).
+* `id` (optional): Manually specify the chain IDs of the entity using a list of strings. The length of the list must be equal to the value of `count`, e.g. `"id": ["H", "L"]`.
 * `modifications`: An optional list of dictionaries describing RNA chemical modifications:
   * `modificationType`: A string containing CCD code of modification.
   * `basePosition`: The position of the modified nucleotide (integer).
@@ -138,17 +141,17 @@ the DNA chemical modifications:
 
 #### Tools for Generating MSA and Template Information
 Protenix provides CLI tools to automate the searching of MSAs and templates, which will automatically update your input JSON file with the relevant paths:
-*   `steerable-v1 mt`: Performs an MSA search followed by a template search.
-*   `steerable-v1 prep`: A comprehensive command that sequentially performs protein MSA, template, and RNA MSA searches.
+*   `steerable mt`: Performs an MSA search followed by a template search.
+*   `steerable prep`: A comprehensive command that sequentially performs protein MSA, template, and RNA MSA searches.
 
 Example usage:
 ```bash
 # Add template information to an existing JSON
-steerable-v1 mt -i your_input_without_msa.json -o ./output
+steerable mt -i your_input_without_msa.json -o ./output
 
 # Add both template and RNA MSA information to an existing JSON
 # Note: To force a fresh search, ensure any existing 'unpairedMsaPath' fields are removed from the JSON.
-steerable-v1 prep -i your_input_with_rna.json -o ./output
+steerable prep -i your_input_with_rna.json -o ./output
 ```
 
 ##### ligand
@@ -178,6 +181,7 @@ steerable-v1 prep -i your_input_with_rna.json -o ./output
   * A path to a molecular structure file, prefixed with "FILE_", where the supported file formats are PDB, SDF, MOL, and MOL2. The file must include the 3D conformation of the molecule.
 
 * `count` is the number of copies of this ligand (integer).
+* `id` (optional): Manually specify the chain IDs of the entity using a list of strings. The length of the list must be equal to the value of `count`, e.g. `"id": ["H", "L"]`.
 
 ##### ion
 ```json
@@ -196,6 +200,7 @@ steerable-v1 prep -i your_input_with_rna.json -o ./output
 ```
 * `ion`: A string containing the CCD code for the ion. Note that, unlike ligands, the ion code **does not** start with "CCD_".
 * `count`: The number of copies of this ion (integer).
+* `id` (optional): Manually specify the chain IDs of the entity using a list of strings. The length of the list must be equal to the value of `count`, e.g. `"id": ["H", "L"]`.
 
 #### covalent_bonds
 ```json

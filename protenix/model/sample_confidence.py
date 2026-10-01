@@ -110,13 +110,6 @@ def _compute_full_data_and_summary(
 
     summary_confidence = {}
     summary_confidence["plddt"] = full_data["atom_plddt"].mean(dim=-1) * 100  # [N_s, ]
-
-    # save pAE(N*N) (fix by yjkim 20260122)
-    pae_matrix = full_data["token_pair_pae"]
-    ca_mask = token_has_frame.bool()  # [N_token]
-    ca_pae_matrix = pae_matrix[:, ca_mask][:, :, ca_mask]
-    summary_confidence["pae_matrix"] = ca_pae_matrix.to(torch.float16)
-
     summary_confidence["gpde"] = (
         full_data["token_pair_pde"] * full_data["contact_probs"]
     ).sum(dim=[-1, -2]) / full_data["contact_probs"].sum(dim=[-1, -2])

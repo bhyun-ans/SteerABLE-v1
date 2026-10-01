@@ -205,7 +205,7 @@ class InferenceRunner(object):
     # NOTE: no @torch.no_grad() here. When epitope-guided sampling is active,
     # autograd must flow through the denoiser so the reward can backprop to the
     # trunk embeddings. sample_diffusion enters torch.enable_grad() locally on
-    # its guided branch; the baseline path wraps itself in
+    # its guided branch; the baseline / TFG-only path wraps itself in
     # torch.no_grad() below to preserve prior memory behaviour.
     # The grad/amp state relaxed here is re-tightened per sampling branch inside
     # _main_inference_loop, so the unguided branch of a gated run still samples
@@ -234,9 +234,10 @@ class InferenceRunner(object):
         # and that is already handled where it belongs: sample_diffusion runs
         # under autocasting_disable_decorator(skip_amp.sample_diffusion), which
         # casts its inputs to fp32 and disables autocast for the sampler.
-        # (update_inference_configs only clears that flag above 3840 tokens.)
-        # Suppressing amp for the whole forward instead silently ignored the
-        # requested dtype and cost the trunk its bf16 speed and memory.
+        # (update_inference_configs only clears that flag above 3840 tokens, and
+        # protenix-v2 refuses anything over 2560.) Suppressing amp for the whole
+        # forward instead silently ignored the requested dtype and cost the trunk
+        # its bf16 speed and memory.
         if torch.cuda.is_available():
             enable_amp = torch.autocast(device_type="cuda", dtype=eval_precision)
         else:
@@ -532,9 +533,6 @@ def update_inference_configs(configs: Any, n_token: int) -> Any:
         requested = configs._requested_diffusion_chunk_size
         if requested is None:
             requested = configs.sample_diffusion["N_sample"]
-        # NOTE (SteerABLE-v1): these ceilings were calibrated on Protenix-v2
-        # (c_z=256). Protenix-v1's pair embedding is half as wide (c_z=128), so
-        # they are conservative here; the backoff below is still the safety net.
         # Calibrated on a 48 GB A6000, fp32, N_sample=5, gating.mode=both:
         #   349 fits at chunk 5,  395 does not
         #   490 fits at chunk 3
@@ -560,6 +558,11 @@ def update_inference_configs(configs: Any, n_token: int) -> Any:
         configs.infer_setting.sample_diffusion_chunk_size = chunk
 
     # Adjust configurations based on sequence length to manage memory usage
+    if n_token > 2560 and configs.model_name in ["protenix-v2"]:
+        raise AssertionError(
+            "protenix-v2 model does not support n_token > 2560. It might cause OOM."
+        )
+
     if n_token > 3840:
         configs.skip_amp.confidence_head = False
         configs.skip_amp.sample_diffusion = False
@@ -567,7 +570,10 @@ def update_inference_configs(configs: Any, n_token: int) -> Any:
         configs.skip_amp.confidence_head = False
         configs.skip_amp.sample_diffusion = True
     else:
-        configs.skip_amp.confidence_head = True
+        if configs.model_name in ["protenix-v2"]:
+            configs.skip_amp.confidence_head = False
+        else:
+            configs.skip_amp.confidence_head = True
         configs.skip_amp.sample_diffusion = True
 
     return configs
@@ -874,6 +880,12 @@ def run() -> None:
     model_name_parts = model_name.split("_", 3)
     if len(model_name_parts) == 4:
         _, model_size, model_feature, model_version = model_name_parts
+    elif model_name == "protenix-v2":
+        # The model naming convention has been simplified for newer versions.
+        # Hardcoding these values here to maintain backward compatibility.
+        model_size = "464M"
+        model_feature = "default"
+        model_version = "v2"
     else:
         model_size = "unknown"
         model_feature = "unknown"
@@ -901,25 +913,6 @@ def run() -> None:
     # also shifts every MSA subset the trunk samples afterwards. Measured on
     # 8dtn: coin True gives enrichment 3.4052, coin False gives 1.8928. Say the
     # effective rate out loud so a run's trunk regime is never a mystery.
-    # "checkpointing" here is the autograd sense (sparse activation waypoints,
-    # recompute the span after each one), not saved weights. blocks_per_ckpt is
-    # the span length: 1 = the most checkpointing, None = none at all
-    # (`--blocks_per_ckpt null`). It only bites where grad is on -- diffusion.py
-    # disables it whenever torch.is_grad_enabled() is False -- so at inference
-    # only the epitope-steered branch pays it; the unguided branch never does.
-    _bpc = configs.blocks_per_ckpt
-    logger.info(
-        f"Activation checkpointing: blocks_per_ckpt={_bpc} -- "
-        + (
-            "OFF, block activations are KEPT for backward (no recompute: faster, "
-            "but the steered branch holds much more memory and may OOM on large "
-            "targets or large sample chunks; the OOM backoff restores it)"
-            if _bpc is None
-            else f"ON every {_bpc} block(s), activations are DISCARDED and "
-            "recomputed during backward (one extra forward: slower, much less "
-            "memory). Only the epitope-steered branch pays this."
-        )
-    )
     logger.info(
         f"MC dropout: apply_rate={configs.mc_dropout_apply_rate} "
         f"(rate={configs.mc_dropout_rate}) -- "

@@ -11,15 +11,15 @@
         ```
 
 2. Pull the Docker image
-    This is upstream Protenix's dependency image and works unchanged for SteerABLE-v1: it contains PyTorch, HMMER, Kalign, CUTLASS and the rest, but no source code. You mount your own checkout into it.
+    This is upstream Protenix's dependency image and works unchanged for SteerABLE: it contains PyTorch, HMMER, Kalign, CUTLASS and the rest, but no source code. You mount your own checkout into it.
     ```bash
     docker pull ai4s-share-public-cn-beijing.cr.volces.com/release/protenix:1.0.0.4
     ```
 
 3. Clone this repository
     ```bash
-    git clone https://github.com/bhyun-ans/SteerABLE-v1.git
-    cd ./SteerABLE-v1
+    git clone https://github.com/bhyun-ans/SteerABLE.git
+    cd ./SteerABLE
     ```
 
 4. Run Docker with an interactive shell
@@ -32,14 +32,14 @@
         /bin/bash
     ```
 
-5. Install SteerABLE-v1 and verify
+5. Install SteerABLE and verify
     Once inside the container, install in editable mode and verify:
     ```bash
     cd /app
     pip install -e .
     
     # Verify the installation by checking the help message
-    steerable-v1 --help
+    steerable --help
     ```
 
 After completing these steps, you can proceed with inference or training. See [Inference Guide](infer_json_format.md) for more details.

@@ -316,7 +316,7 @@ class TestChunkSizeCapAndBackoff(unittest.TestCase):
         from types import SimpleNamespace
 
         return SimpleNamespace(
-            model_name="protenix_base_default_v1.0.0",
+            model_name="protenix-v2",
             epitope_residue=epitope,
             skip_amp=SimpleNamespace(confidence_head=False, sample_diffusion=True),
             infer_setting=SimpleNamespace(sample_diffusion_chunk_size=chunk),

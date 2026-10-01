@@ -27,7 +27,7 @@
       RUN git clone -b v3.5.1 https://github.com/NVIDIA/cutlass.git  /opt/cutlass
       ENV CUTLASS_PATH=/opt/cutlass
       ```
-      If you installed SteerABLE-v1 with `pip`, set `CUTLASS_PATH` as follows:
+      If you installed SteerABLE with `pip`, set `CUTLASS_PATH` as follows:
 
       ```bash
       git clone -b v3.5.1 https://github.com/NVIDIA/cutlass.git  /path/to/cutlass

@@ -6,6 +6,9 @@
     "proteinChain": {
      "sequence": "DVQLVESGGGLVQPGGSLRLSCTVSGIDLSSYDMTWVRQAPGKGLEYIGYISYVSRTYYADSVKGRFTISKDTSKNTVYLQMNSLRAEDTAVYYCARDRPDGAATNLWGQGTLVTVSS",
      "count": 1,
+     "id": [
+      "A"
+     ],
      "pairedMsaPath": "examples/steerable/7yds/msa/A/paired.a3m",
      "unpairedMsaPath": "examples/steerable/7yds/msa/A/unpaired.a3m"
     }
@@ -14,6 +17,9 @@
     "proteinChain": {
      "sequence": "DIQMTQSPSTLSASVGDRVTITCQSSQNVYSNNRLSWYQQKPGKAPKLLIYWTSFLASGVPSRFSGSGSGTEFTLTISSLQPDDFATYYCAGGYSGNLYTFGQGTKLEIK",
      "count": 1,
+     "id": [
+      "B"
+     ],
      "pairedMsaPath": "examples/steerable/7yds/msa/B/paired.a3m",
      "unpairedMsaPath": "examples/steerable/7yds/msa/B/unpaired.a3m"
     }
@@ -22,6 +28,9 @@
     "proteinChain": {
      "sequence": "MRIFAVFIFMTYWHLLNAFTVTVPKDLYVVEYGSQMTIECKFPVEKQLDLAALIVYWEMEDKNIIQFVHGEEDLKVQHSSYRQRARLLKDQLSLGNAALQITDVKLQDAGVYRCMISYGGADYKRITVKVNAPYNKLEGGGHHHHHH",
      "count": 1,
+     "id": [
+      "C"
+     ],
      "pairedMsaPath": "examples/steerable/7yds/msa/C/paired.a3m",
      "unpairedMsaPath": "examples/steerable/7yds/msa/C/unpaired.a3m"
     }
